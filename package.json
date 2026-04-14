@@ -1,0 +1,7 @@
+{
+  "name": "agentd",
+  "keywords": ["pi-package"],
+  "pi": {
+    "skills": ["./scaffold/skills"]
+  }
+}

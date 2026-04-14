@@ -1,0 +1,1 @@
+../../../../../scaffold/skills/agentd/SKILL.md
