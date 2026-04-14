@@ -1,0 +1,1 @@
+../../../scaffold/AGENTS.md

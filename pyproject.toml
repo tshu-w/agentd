@@ -1,0 +1,59 @@
+[project]
+name = "agentd"
+version = "0.1.0"
+description = "Durable coordination daemon for AI agents"
+authors = [
+  { name = "Tianshu Wang", email = "wang@tianshu.me" },
+]
+readme = "README.md"
+requires-python = ">=3.12"
+license = {file = "LICENSE"}
+classifiers = [
+  "Operating System :: POSIX",
+  "Operating System :: MacOS",
+]
+dependencies = [
+  "pydantic>=2.11.0",
+  "pyyaml>=6.0.2",
+  "croniter>=5.0",
+]
+
+[project.optional-dependencies]
+telegram = ["aiohttp>=3.9", "python-dotenv>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/tshu-w/agentd"
+Repository = "https://github.com/tshu-w/agentd"
+Issues = "https://github.com/tshu-w/agentd/issues"
+
+[project.scripts]
+agentd = "agentd.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10.4,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4.0",
+  "pytest-asyncio>=1.1.0",
+  "ruff>=0.12.8",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ty.src]
+include = ["src", "tests"]
+
+[tool.ty.environment]
+python-version = "3.12"
