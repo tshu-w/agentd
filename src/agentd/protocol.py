@@ -118,7 +118,6 @@ class EventType(StrEnum):
     TURN_OPENED = "turn.opened"
     TURN_STARTED = "turn.started"
     TURN_PROGRESS = "turn.progress"
-    TURN_RESULT = "turn.result"
     TURN_END = "turn.end"
     ACTOR_CLOSED = "actor.closed"
     CHECKPOINT_LOADED = "actor.checkpoint.loaded"
@@ -280,9 +279,21 @@ def render_prompt(messages: list[dict[str, Any]]) -> str:
 
 @dataclass
 class ParsedLine:
-    """A normalized backend output line."""
+    """A normalized backend output line.
 
-    event_type: str  # turn.progress, turn.result, turn.end, checkpoint, log
+    Fields are orthogonal signals to the runner:
+      - ``event_type``: "turn.progress" / "turn.end" / "log".
+        "log" means drop (no public event); use it for diagnostics, internal
+        signals, or unmapped backend records.
+      - ``payload``: canonical schema payload. Only used when
+        ``event_type == 'turn.progress'``; ignored otherwise.
+      - ``result``: when not None, runner updates internal ``last_result``.
+        Independent from ``event_type``; works with any value.
+      - ``checkpoint_update``: when not None, runner persists a new checkpoint.
+        Independent from ``event_type``.
+    """
+
+    event_type: str  # "turn.progress" | "turn.end" | "log"
     payload: dict[str, Any] = field(default_factory=dict)
     result: str | None = None
     checkpoint_update: dict[str, Any] | None = None

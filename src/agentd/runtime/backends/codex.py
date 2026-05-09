@@ -47,10 +47,10 @@ class CodexAdapter(BackendAdapter):
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
-            return ParsedLine(event_type="log", payload={"line": line})
+            return ParsedLine(event_type="log")
 
         if not isinstance(obj, dict):
-            return ParsedLine(event_type="log", payload={"line": line})
+            return ParsedLine(event_type="log")
 
         etype = str(obj.get("type", ""))
 
@@ -59,7 +59,6 @@ class CodexAdapter(BackendAdapter):
             thread_id = str(obj.get("thread_id", "")).strip()
             return ParsedLine(
                 event_type="log",
-                payload=obj,
                 checkpoint_update={"thread_id": thread_id} if thread_id else None,
             )
 
@@ -80,21 +79,18 @@ class CodexAdapter(BackendAdapter):
                         "status": "running",
                     },
                 )
-            return ParsedLine(event_type=EventType.TURN_PROGRESS, payload=obj)
+            # Unmapped item: drop (spec §10: raw passthrough forbidden).
+            return ParsedLine(event_type="log")
 
-        # turn.completed → turn end (fallback)
+        # turn.completed → turn end (fallback marker)
         if etype == "turn.completed":
-            return ParsedLine(
-                event_type=EventType.TURN_END,
-                payload=obj,
-                result=None,
-            )
+            return ParsedLine(event_type=EventType.TURN_END)
 
-        # turn.started → progress
+        # turn.started: backend lifecycle marker; no public canonical mapping.
         if etype == "turn.started":
-            return ParsedLine(event_type=EventType.TURN_PROGRESS, payload=obj)
+            return ParsedLine(event_type="log")
 
-        return ParsedLine(event_type="log", payload={"line": line})
+        return ParsedLine(event_type="log")
 
 
 def _parse_item_completed(obj: dict) -> ParsedLine:
@@ -105,7 +101,6 @@ def _parse_item_completed(obj: dict) -> ParsedLine:
         text = str(item.get("text", ""))
         return ParsedLine(
             event_type=EventType.TURN_END,
-            payload=obj,
             result=text or None,
         )
 
@@ -122,7 +117,8 @@ def _parse_item_completed(obj: dict) -> ParsedLine:
             },
         )
 
-    return ParsedLine(event_type=EventType.TURN_PROGRESS, payload=obj)
+    # Unmapped item type: drop.
+    return ParsedLine(event_type="log")
 
 
 def _has_subcommand(args: list[str]) -> bool:

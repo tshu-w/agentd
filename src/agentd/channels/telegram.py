@@ -441,9 +441,6 @@ async def _handle_logs_command(chat_id: str, mid: int | None) -> None:
                 ts = (e.get("created_at") or "")[:19]
                 if etype in {"actor.spawned", "turn.started", "turn.end", "actor.closed"}:
                     summary_lines.append(f"{ts} [{etype}]")
-                elif etype == "turn.result":
-                    r = str((e.get("payload") or {}).get("result", ""))[:80]
-                    summary_lines.append(f"{ts} [result] {r}")
                 elif etype == "turn.progress":
                     p = e.get("payload") or {}
                     ptype = p.get("type", "")
