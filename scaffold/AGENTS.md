@@ -38,6 +38,7 @@ Inbound user input may arrive from different channels, such as CLI or Telegram.
 Read the relevant skill when the task matches:
 
 - `skills/agentd/SKILL.md` — agentd CLI: spawn, emit, wait, stop, monitor agents
+- `skills/supervisor/SKILL.md` — channel-facing root agent coordinating child agents via env.turn_completed
 - `skills/telegram/SKILL.md` — Telegram Bot API: send messages, files, edits
 
 ## Maintenance

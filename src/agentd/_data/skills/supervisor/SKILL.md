@@ -1,0 +1,1 @@
+../../../../../scaffold/skills/supervisor/SKILL.md
