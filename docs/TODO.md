@@ -5,6 +5,7 @@
 - **Control lease**: no arbitration when multiple sources emit to same actor. Required for multi-bot / team.
 - **Server layer**: UI dashboard needs HTTP/WebSocket beyond localhost. `http_gateway.py` is a starting point.
 - **Optimistic concurrency**: actor state has no version number.
+- **Mailbox `from` field**: emit currently has no sender identity. Peer messages (actor → actor) and env messages (channel/trigger/webhook) collapse into the same source-less stream. Add optional `from` to `actor.emit` (CLI auto-fills from `AGENTD_ACTOR_ID`) so peer reasoning, commitment chains, and trigger filtering by sender become possible. Trigger when dialectic / debate / red-team patterns or sender-based trigger filters are needed.
 
 Priority order (each layer is prerequisite for the next):
 1. Live delivery (Pi RPC) — single-actor experience

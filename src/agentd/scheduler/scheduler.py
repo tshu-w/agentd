@@ -406,8 +406,26 @@ class Scheduler:
             seq,
         )
 
-        # Check for next queued message (wakeup chain)
+        # Notify parent BEFORE the child's own wakeup chain so the bus event
+        # order is causal: child.turn.end → parent.mailbox → child.turn.opened
+        # (next). Otherwise a chatty child can also starve its parent of a
+        # dispatch slot under tight concurrency limits.
+        #
+        # In v1 single-loop asyncio nothing else mutates this child's row
+        # while we await the parent emit, so the actor snapshot stays valid
+        # for the wakeup-chain check below.
         actor = self.store.get_actor(actor_id)
+        if actor and actor.get("parent_actor_id"):
+            await self._notify_parent_turn_completed(
+                parent_actor_id=actor["parent_actor_id"],
+                child=actor,
+                turn_id=turn_id,
+                outcome=outcome,
+                result=result,
+                error=error,
+            )
+
+        # Check for next queued message (child's own wakeup chain)
         if (
             actor
             and actor["state"] == ActorState.IDLE.value
@@ -434,6 +452,78 @@ class Scheduler:
         )
         self._publish_event(actor_id, turn_id, event_type, payload, seq)
         return seq
+
+    async def _notify_parent_turn_completed(
+        self,
+        *,
+        parent_actor_id: str,
+        child: dict[str, Any],
+        turn_id: str,
+        outcome: TurnOutcome,
+        result: str | None,
+        error: str | None,
+    ) -> None:
+        """Auto-emit env.turn_completed to the parent's mailbox on child turn.end.
+
+        Convention path for the supervisor pattern: the daemon already knows
+        the parent-child relationship and the moment a turn ends, so it can
+        wake the parent without going through user-defined event triggers.
+        Parents stay in control of how they react (skill prompt drives it);
+        the daemon's job is just to deliver the signal.
+
+        Heuristic: INTERRUPTED / CANCELED outcomes are suppressed because they
+        usually originate from the parent (or a user via the parent) calling
+        stop/close, so the parent already knows. This is imperfect for the
+        grandparent-closes-subtree case (parent loses a signal); revisit if a
+        real workflow needs that distinction.
+
+        Delivery is best-effort: any exception is swallowed so the rest of
+        on_turn_completed (notably _try_schedule_waiting) keeps running. The
+        child's turn.end is already persisted; missing a wakeup is recoverable
+        by the supervisor checking `agentd ps`, missing global scheduling is
+        not.
+        """
+        if outcome in (TurnOutcome.INTERRUPTED, TurnOutcome.CANCELED):
+            return
+
+        payload: dict[str, Any] = {
+            "actor_id": child["actor_id"],
+            "actor_name": child.get("name"),
+            "turn_id": turn_id,
+            "outcome": outcome.value,
+        }
+        if result is not None:
+            payload["result"] = result
+        if error is not None:
+            payload["error"] = error
+
+        try:
+            await self.emit(
+                actor_id=parent_actor_id,
+                msg_type="env.turn_completed",
+                msg_payload=payload,
+            )
+        except SchedulerError as exc:
+            if exc.error_type == "actor_closed":
+                # Expected race: parent closed between turn.end and notify.
+                logger.debug(
+                    "parent %s closed; dropping turn_completed notification for %s",
+                    parent_actor_id,
+                    child["actor_id"],
+                )
+            else:
+                logger.warning(
+                    "unexpected SchedulerError notifying parent=%s child=%s: %s",
+                    parent_actor_id,
+                    child["actor_id"],
+                    exc,
+                )
+        except Exception:
+            logger.exception(
+                "failed to notify parent=%s about child=%s",
+                parent_actor_id,
+                child["actor_id"],
+            )
 
     # ------------------------------------------------------------------
     # Internal helpers

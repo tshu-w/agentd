@@ -681,6 +681,18 @@ Model-level invariants are defined in §2. This section defines table structure,
 - `claimed`: bound to an opened turn, waiting for that turn to complete
 - `acked`: consumed by a completed turn
 
+#### Message type taxonomy
+
+| Form | Origin | Examples |
+|---|---|---|
+| bare predicate | peer-to-peer message authored by a user or another actor | `message` |
+| `env.<source>.<event>` | inbound from outside the daemon | `env.telegram.message`, `env.webhook.github.push` |
+| `env.<predicate>` | daemon-internal observation | `env.turn_completed` |
+
+Daemon-internal `env.<predicate>` messages are environment observations delivered by the daemon, not authored by a peer actor.
+
+- **`env.turn_completed`**: emitted to the direct parent's mailbox when a child actor's turn settles. Payload: `actor_id`, `actor_name`, `turn_id`, `outcome`, optional final text `result`, optional `error`. Delivery: best-effort, at-most-once.
+
 ### Events
 
 Append-only log. `seq` is globally monotonically increasing, providing cross-actor global ordering.
