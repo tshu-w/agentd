@@ -441,9 +441,6 @@ async def _handle_logs_command(chat_id: str, mid: int | None) -> None:
                 ts = (e.get("created_at") or "")[:19]
                 if etype in {"actor.spawned", "turn.started", "turn.end", "actor.closed"}:
                     summary_lines.append(f"{ts} [{etype}]")
-                elif etype == "turn.result":
-                    r = str((e.get("payload") or {}).get("result", ""))[:80]
-                    summary_lines.append(f"{ts} [result] {r}")
                 elif etype == "turn.progress":
                     p = e.get("payload") or {}
                     ptype = p.get("type", "")
@@ -497,7 +494,7 @@ async def handle_command(chat_id: str, text: str, message: dict) -> bool:
             "/stop — stop current actor\n"
             "/status — actor info\n"
             "/logs — recent actor activity\n"
-            "/restart — restart adapter process\n"
+            "/restart — restart Telegram channel\n"
             "/help — this message",
             mid,
         )
@@ -527,7 +524,7 @@ async def handle_command(chat_id: str, text: str, message: dict) -> bool:
             await send_text(chat_id, f"❌ Stop failed: {e}", mid)
         return True
     if cmd == "/restart":
-        await send_text(chat_id, "♻️ Restarting adapter…", mid)
+        await send_text(chat_id, "♻️ Restarting Telegram channel…", mid)
         await asyncio.sleep(0.5)
         os._exit(0)
 

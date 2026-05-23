@@ -52,17 +52,15 @@ class PiAdapter(BackendAdapter):
         return ["pi"] + args
 
     def parse_line(self, line: str) -> ParsedLine:
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            return ParsedLine(event_type="log", payload={"line": line})
-
+        obj = json.loads(line)
         if not isinstance(obj, dict):
-            return ParsedLine(event_type="log", payload={"line": line})
+            raise ValueError("backend output JSON must be an object")
 
         etype = str(obj.get("type", "")).strip()
 
-        # Session info → checkpoint update (store richer locator)
+        # Session info → checkpoint update (store richer locator).
+        # raw `obj` is not forwarded as public payload (spec §10); only the
+        # canonical checkpoint locator escapes.
         if etype == "session":
             session_id = str(obj.get("id", "")).strip()
             if session_id:
@@ -75,22 +73,16 @@ class PiAdapter(BackendAdapter):
                     cp["session_timestamp"] = session_ts
             else:
                 cp = None  # type: ignore[assignment]
-            return ParsedLine(
-                event_type="log",
-                payload=obj,
-                checkpoint_update=cp,
-            )
+            return ParsedLine(event_type="log", checkpoint_update=cp)
 
-        # turn_end → extract result but do NOT signal TURN_END.
-        # pi emits turn_end after each assistant turn (tool-use turn, reply turn, …).
-        # The real end of the conversation is when the process exits.
+        # turn_end → internal last_result update only.
+        # pi emits turn_end after each assistant turn (tool-use turn, reply
+        # turn, ...). The real end is process exit. The raw turn_end object
+        # MUST NOT be forwarded as a public payload (spec §4 / §10): it can
+        # carry full tool results (~100 KB+) and is backend-specific.
         if etype == "turn_end":
             result = _extract_assistant_text(obj)
-            return ParsedLine(
-                event_type=EventType.TURN_RESULT,
-                payload=obj,
-                result=result,
-            )
+            return ParsedLine(event_type="log", result=result)
 
         # text_delta → progress.text
         if etype == "text_delta":
@@ -131,15 +123,12 @@ class PiAdapter(BackendAdapter):
                 },
             )
 
-        # result/final → turn.result
+        # result/final → internal last_result update only.
+        # raw obj MUST NOT be forwarded as public payload (spec §10).
         if etype in ("result", "final", "done"):
             result = obj.get("result") or obj.get("text")
             result_text = str(result) if result is not None else None
-            return ParsedLine(
-                event_type=EventType.TURN_RESULT,
-                payload=obj,
-                result=result_text,
-            )
+            return ParsedLine(event_type="log", result=result_text)
 
         # message_update → extract standard progress from assistantMessageEvent
         if etype == "message_update":
@@ -175,7 +164,7 @@ class PiAdapter(BackendAdapter):
                         "status": "completed",
                     },
                 )
-            return ParsedLine(event_type="log", payload={"line": line})
+            return ParsedLine(event_type="log")
 
         # tool_execution_start/end → progress.tool_call
         if etype == "tool_execution_start":
@@ -199,7 +188,7 @@ class PiAdapter(BackendAdapter):
                 },
             )
 
-        return ParsedLine(event_type="log", payload={"line": line})
+        return ParsedLine(event_type="log")
 
 
 def _extract_assistant_text(obj: dict) -> str | None:

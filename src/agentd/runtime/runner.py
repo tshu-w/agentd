@@ -74,18 +74,32 @@ async def _readline_resilient(
     reader: asyncio.StreamReader,
     *,
     turn_id: str,
+    backend_name: str | None = None,
+    stats: dict[str, int] | None = None,
 ) -> bytes | None:
-    """Read one line, skipping oversized records without aborting the turn."""
+    """Read one line, skipping oversized records without aborting the turn.
+
+    When ``stats`` is provided it accumulates dropped-line metrics:
+      - ``dropped_lines``: number of oversized lines discarded.
+      - ``dropped_bytes``: approximate total bytes dropped (incl. trailing
+        newline when present).
+    Caller can surface these in the final outcome (spec §11:
+    ``backend_record_too_large``).
+    """
     while True:
         try:
             return await reader.readuntil(b"\n")
         except asyncio.LimitOverrunError as exc:
             dropped = await _discard_overlong_line(reader, exc.consumed)
             logger.warning(
-                "dropped oversized backend output line for turn=%s bytes=%d",
+                "dropped oversized backend output line for turn=%s backend=%s bytes=%d",
                 turn_id,
+                backend_name or "unknown",
                 dropped,
             )
+            if stats is not None:
+                stats["dropped_lines"] = stats.get("dropped_lines", 0) + 1
+                stats["dropped_bytes"] = stats.get("dropped_bytes", 0) + dropped
             if dropped == 0:
                 return None
         except asyncio.IncompleteReadError as exc:
@@ -112,6 +126,19 @@ def _resolve_process_outcome(
     if got_turn_end or last_result is not None:
         return TurnOutcome.SUCCEEDED, None
     return TurnOutcome.FAILED, "no turn.end received"
+
+
+def _append_backend_record_too_large_error(
+    error: str | None,
+    stdout_stats: dict[str, int],
+) -> str:
+    diag = (
+        f"dropped {stdout_stats['dropped_lines']} oversized stdout "
+        f"line(s) ({stdout_stats['dropped_bytes']} bytes) exceeding "
+        f"{STREAM_READ_LIMIT} bytes (BACKEND_INPUT_MAX)"
+    )
+    prefix = f"backend_record_too_large: {diag}"
+    return prefix if not error else f"{error}; {prefix}"
 
 
 async def _read_stderr_capped(
@@ -352,13 +379,19 @@ class Runtime:
         last_result: str | None = None
         new_checkpoint: dict[str, Any] | None = None
         stderr_text = ""
+        stdout_stats: dict[str, int] = {"dropped_lines": 0, "dropped_bytes": 0}
 
         async def _consume_stdout() -> None:
             nonlocal got_turn_end, last_result, new_checkpoint
             try:
                 assert process.stdout is not None
                 while True:
-                    line_bytes = await _readline_resilient(process.stdout, turn_id=turn_id)
+                    line_bytes = await _readline_resilient(
+                        process.stdout,
+                        turn_id=turn_id,
+                        backend_name=backend_name,
+                        stats=stdout_stats,
+                    )
                     if line_bytes is None:
                         break
 
@@ -383,16 +416,16 @@ class Runtime:
                         parsed,
                     )
 
+                    # Update last_result from any parsed line that carries one
+                    # (spec §10: orthogonal to event_type).
+                    if parsed.result is not None:
+                        last_result = parsed.result
+                    if parsed.checkpoint_update is not None:
+                        new_checkpoint = parsed.checkpoint_update
+
                     if parsed.event_type == EventType.TURN_END:
                         got_turn_end = True
-                        if parsed.result is not None:
-                            last_result = parsed.result
                         break
-                    elif parsed.event_type == EventType.TURN_RESULT:
-                        if parsed.result is not None:
-                            last_result = parsed.result
-                    elif parsed.checkpoint_update is not None:
-                        new_checkpoint = parsed.checkpoint_update
             except Exception:
                 logger.exception("error reading output for turn=%s", turn_id)
 
@@ -490,12 +523,19 @@ class Runtime:
             if stderr_text:
                 error += f": {stderr_text[:500]}"
         else:
-            # Some backends (for example pi) emit the final answer as TURN_RESULT
-            # and use process exit as the terminal signal.
+            # Some backends (for example pi) emit the final answer via
+            # ParsedLine.result (no public turn.end event) and use process exit
+            # as the terminal signal.
             outcome, error = _resolve_process_outcome(
                 got_turn_end=got_turn_end,
                 last_result=last_result,
             )
+
+        # Spec §11: surface oversized-line diagnostics on any failure path so
+        # the root cause (BACKEND_INPUT_MAX exceeded) is not masked by a
+        # generic exit-code / timeout / no-turn-end message.
+        if outcome == TurnOutcome.FAILED and stdout_stats["dropped_lines"] > 0:
+            error = _append_backend_record_too_large_error(error, stdout_stats)
 
         await self.scheduler.on_turn_completed(
             turn_id,
@@ -556,9 +596,11 @@ class Runtime:
     ) -> None:
         """Handle a parsed output line by emitting appropriate events."""
         etype = parsed.event_type
-        # Only publish progress/result events here.
+        # Only publish progress events here.
+        # ParsedLine.result is an internal runtime signal (spec §4 / §10):
+        # it updates last_result in _consume_stdout but is NOT published.
         # TURN_END is published once by scheduler.on_turn_completed (canonical).
-        if etype in (EventType.TURN_PROGRESS, EventType.TURN_RESULT):
+        if etype == EventType.TURN_PROGRESS:
             self.scheduler.publish_event(
                 actor_id,
                 turn_id,

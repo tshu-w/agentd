@@ -52,13 +52,9 @@ class ClaudeAdapter(BackendAdapter):
         return ["claude"] + args
 
     def parse_line(self, line: str) -> ParsedLine:
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            return ParsedLine(event_type="log", payload={"line": line})
-
+        obj = json.loads(line)
         if not isinstance(obj, dict):
-            return ParsedLine(event_type="log", payload={"line": line})
+            raise ValueError("backend output JSON must be an object")
 
         etype = str(obj.get("type", ""))
 
@@ -67,7 +63,6 @@ class ClaudeAdapter(BackendAdapter):
             session_id = str(obj.get("session_id", "")).strip()
             return ParsedLine(
                 event_type="log",
-                payload=obj,
                 checkpoint_update={"session_id": session_id} if session_id else None,
             )
 
@@ -75,11 +70,9 @@ class ClaudeAdapter(BackendAdapter):
         if etype == "assistant":
             if obj.get("error"):
                 error_msg = _extract_text(obj) or str(obj["error"])
-                return ParsedLine(
-                    event_type=EventType.TURN_RESULT,
-                    payload=obj,
-                    result=f"Error: {error_msg}",
-                )
+                # Carry error text as internal last_result; final canonical
+                # turn.end will surface it. raw obj MUST NOT be public payload.
+                return ParsedLine(event_type="log", result=f"Error: {error_msg}")
             return _parse_assistant(obj)
 
         # result → turn.end (final summary from Claude)
@@ -89,19 +82,18 @@ class ClaudeAdapter(BackendAdapter):
                 result_text = f"Error: {result_text}" if result_text else "Error: unknown"
             return ParsedLine(
                 event_type=EventType.TURN_END,
-                payload=obj,
                 result=result_text,
             )
 
-        # user (tool_result) → progress
+        # user (tool_result): backend-specific, no canonical mapping. Drop.
         if etype == "user":
-            return ParsedLine(event_type=EventType.TURN_PROGRESS, payload=obj)
+            return ParsedLine(event_type="log")
 
         # stream_event → normalize to progress subtypes
         if etype == "stream_event":
             return _parse_stream_event(obj)
 
-        return ParsedLine(event_type="log", payload={"line": line})
+        return ParsedLine(event_type="log")
 
 
 def _parse_assistant(obj: dict) -> ParsedLine:
@@ -109,7 +101,7 @@ def _parse_assistant(obj: dict) -> ParsedLine:
     message = obj.get("message") or {}
     content = message.get("content")
     if not isinstance(content, list):
-        return ParsedLine(event_type=EventType.TURN_PROGRESS, payload=obj)
+        return ParsedLine(event_type="log")
 
     text_parts: list[str] = []
     has_tool_use = False
@@ -156,11 +148,10 @@ def _parse_assistant(obj: dict) -> ParsedLine:
         result = "\n".join(text_parts)
         return ParsedLine(
             event_type=EventType.TURN_END,
-            payload=obj,
             result=result,
         )
 
-    return ParsedLine(event_type=EventType.TURN_PROGRESS, payload=obj)
+    return ParsedLine(event_type="log")
 
 
 def _parse_stream_event(obj: dict) -> ParsedLine:
@@ -180,7 +171,8 @@ def _parse_stream_event(obj: dict) -> ParsedLine:
             payload={"type": ProgressType.THINKING, "content": str(event.get("text", ""))},
         )
 
-    return ParsedLine(event_type=EventType.TURN_PROGRESS, payload=obj)
+    # Unmapped stream event: drop (spec §10 raw passthrough forbidden).
+    return ParsedLine(event_type="log")
 
 
 def _extract_text(obj: dict) -> str | None:

@@ -9,6 +9,18 @@ from agentd.runtime.backends.claude import ClaudeAdapter
 from agentd.runtime.backends.codex import CodexAdapter
 from agentd.runtime.backends.pi import PiAdapter
 
+@pytest.mark.parametrize("adapter", [PiAdapter(), ClaudeAdapter(), CodexAdapter()])
+def test_malformed_json_raises_for_runner_warning(adapter):
+    with pytest.raises(json.JSONDecodeError):
+        adapter.parse_line("not json at all")
+
+
+@pytest.mark.parametrize("adapter", [PiAdapter(), ClaudeAdapter(), CodexAdapter()])
+def test_non_dict_json_raises_for_runner_warning(adapter):
+    with pytest.raises(ValueError, match="backend output JSON must be an object"):
+        adapter.parse_line('"just a string"')
+
+
 # ---------------------------------------------------------------------------
 # pi
 # ---------------------------------------------------------------------------
@@ -113,7 +125,10 @@ class TestPi:
             }
         )
         parsed = self.adapter.parse_line(line)
-        assert parsed.event_type == EventType.TURN_RESULT
+        # Spec §4: turn.result is internal; raw obj must not be public payload.
+        # pi maps turn_end to an internal last_result update via ParsedLine.result.
+        assert parsed.event_type == "log"
+        assert parsed.payload == {}
         assert parsed.result == "result text"
 
     def test_parse_text_delta(self):
@@ -170,15 +185,6 @@ class TestPi:
         assert cp["session_cwd"] == "/home/user/project"
         assert cp["session_timestamp"] == "2026-03-07T17:56:18.243Z"
 
-    def test_parse_invalid_json(self):
-        parsed = self.adapter.parse_line("not json at all")
-        assert parsed.event_type == "log"
-
-    def test_parse_non_dict_json(self):
-        parsed = self.adapter.parse_line('"just a string"')
-        assert parsed.event_type == "log"
-
-
 # ---------------------------------------------------------------------------
 # claude
 # ---------------------------------------------------------------------------
@@ -226,7 +232,7 @@ class TestClaude:
         line = json.dumps(
             {
                 "type": "assistant",
-                "content": [{"type": "text", "text": "output"}],
+                "message": {"content": [{"type": "text", "text": "output"}]},
             }
         )
         parsed = self.adapter.parse_line(line)
@@ -236,7 +242,7 @@ class TestClaude:
         line = json.dumps(
             {
                 "type": "assistant",
-                "content": [{"type": "thinking", "thinking": "hmm..."}],
+                "message": {"content": [{"type": "thinking", "thinking": "hmm..."}]},
             }
         )
         parsed = self.adapter.parse_line(line)
@@ -246,18 +252,57 @@ class TestClaude:
         line = json.dumps(
             {
                 "type": "assistant",
-                "content": [
-                    {"type": "tool_use", "name": "read", "input": {"path": "f.py"}},
-                ],
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "name": "read", "input": {"path": "f.py"}},
+                    ],
+                },
             }
         )
         parsed = self.adapter.parse_line(line)
         assert parsed.event_type == EventType.TURN_PROGRESS
 
+    def test_parse_assistant_without_message_envelope_drops(self):
+        # Spec §10: unmapped/malformed assistant content is dropped, not
+        # passed through as raw payload.
+        line = json.dumps(
+            {"type": "assistant", "content": [{"type": "text", "text": "x"}]}
+        )
+        parsed = self.adapter.parse_line(line)
+        assert parsed.event_type == "log"
+        assert parsed.payload == {}
 
-# ---------------------------------------------------------------------------
-# codex
-# ---------------------------------------------------------------------------
+    def test_parse_user_tool_result_drops(self):
+        # claude `user` events carry tool_result content (potentially MB-sized);
+        # they must not be forwarded as public payload.
+        line = json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "content": [{"type": "tool_result", "content": "x" * 100000}]
+                },
+            }
+        )
+        parsed = self.adapter.parse_line(line)
+        assert parsed.event_type == "log"
+        assert parsed.payload == {}
+
+    def test_parse_unmapped_stream_event_drops(self):
+        line = json.dumps(
+            {
+                "type": "stream_event",
+                "event": {"content_type": "unknown_future_type", "data": "x"},
+            }
+        )
+        parsed = self.adapter.parse_line(line)
+        assert parsed.event_type == "log"
+        assert parsed.payload == {}
+
+    def test_parse_unmapped_top_level_event_drops(self):
+        line = json.dumps({"type": "some_future_event", "data": "x"})
+        parsed = self.adapter.parse_line(line)
+        assert parsed.event_type == "log"
+        assert parsed.payload == {}
 
 
 class TestCodex:
@@ -322,6 +367,27 @@ class TestCodex:
         line = json.dumps({"type": "turn.completed"})
         parsed = self.adapter.parse_line(line)
         assert parsed.event_type == EventType.TURN_END
+
+    def test_agent_message_then_turn_completed_keeps_result(self):
+        # Real codex flow: item.completed[agent_message] sets last_result via
+        # ParsedLine.result; subsequent turn.completed signals turn end without
+        # overriding result. Both should be drop-safe public-wise.
+        msg = self.adapter.parse_line(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "final answer"},
+                }
+            )
+        )
+        assert msg.event_type == EventType.TURN_END
+        assert msg.result == "final answer"
+        assert msg.payload == {}
+        end = self.adapter.parse_line(json.dumps({"type": "turn.completed"}))
+        assert end.event_type == EventType.TURN_END
+        # turn.completed has no result; runner keeps last_result from agent_message.
+        assert end.result is None
+        assert end.payload == {}
 
     def test_no_duplicate_subcommand(self):
         """If backend_args already has 'resume', don't add another."""

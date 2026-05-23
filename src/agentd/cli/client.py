@@ -10,6 +10,8 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+from agentd.protocol import AGENTD_FRAME_MAX
+
 
 class RpcError(Exception):
     """Error returned by the daemon."""
@@ -71,7 +73,7 @@ class RpcClient:
         try:
             return await asyncio.open_unix_connection(
                 str(self.socket_path),
-                limit=4 * 1024 * 1024,  # 4MB line limit
+                limit=AGENTD_FRAME_MAX,
             )
         except ConnectionRefusedError:
             raise ConnectionError(

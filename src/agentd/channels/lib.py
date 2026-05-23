@@ -13,7 +13,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any
 
-from agentd.protocol import PublicErrorCode
+from agentd.protocol import AGENTD_FRAME_MAX, PublicErrorCode
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +240,13 @@ async def wait_for_actor(
     on_progress: Any = None,
     since_seq: int = 0,
 ) -> WaitResult:
-    """Wait for an actor turn, streaming progress events."""
+    """Wait for an actor turn, streaming progress events.
+
+    Spec §12 channel readline requirement: agentd CLI streaming output is
+    line-delimited JSON-RPC; the default asyncio readline limit (64 KiB) is
+    not enough for canonical event frames with envelope overhead. Use 4 MiB
+    to align with AGENTD_FRAME_MAX / RpcClient.
+    """
     proc = await asyncio.create_subprocess_exec(
         AGENTD_BIN,
         "wait",
@@ -250,6 +256,7 @@ async def wait_for_actor(
         str(since_seq),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=AGENTD_FRAME_MAX,
         env=_agentd_env(),
     )
 
