@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 ROOT_SCOPE = "__root__"
 DEFAULT_MESSAGE_TYPE = "message"
+AGENTD_FRAME_MAX = 4 * 1024 * 1024
 
 _ID_PREFIXES: dict[str, str] = {
     "act": "act_",

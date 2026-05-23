@@ -9,6 +9,18 @@ from agentd.runtime.backends.claude import ClaudeAdapter
 from agentd.runtime.backends.codex import CodexAdapter
 from agentd.runtime.backends.pi import PiAdapter
 
+@pytest.mark.parametrize("adapter", [PiAdapter(), ClaudeAdapter(), CodexAdapter()])
+def test_malformed_json_raises_for_runner_warning(adapter):
+    with pytest.raises(json.JSONDecodeError):
+        adapter.parse_line("not json at all")
+
+
+@pytest.mark.parametrize("adapter", [PiAdapter(), ClaudeAdapter(), CodexAdapter()])
+def test_non_dict_json_raises_for_runner_warning(adapter):
+    with pytest.raises(ValueError, match="backend output JSON must be an object"):
+        adapter.parse_line('"just a string"')
+
+
 # ---------------------------------------------------------------------------
 # pi
 # ---------------------------------------------------------------------------
@@ -172,15 +184,6 @@ class TestPi:
         assert cp["session_id"] == "ses_abc123"
         assert cp["session_cwd"] == "/home/user/project"
         assert cp["session_timestamp"] == "2026-03-07T17:56:18.243Z"
-
-    def test_parse_invalid_json(self):
-        parsed = self.adapter.parse_line("not json at all")
-        assert parsed.event_type == "log"
-
-    def test_parse_non_dict_json(self):
-        parsed = self.adapter.parse_line('"just a string"')
-        assert parsed.event_type == "log"
-
 
 # ---------------------------------------------------------------------------
 # claude

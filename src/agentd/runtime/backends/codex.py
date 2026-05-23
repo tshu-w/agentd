@@ -44,13 +44,9 @@ class CodexAdapter(BackendAdapter):
         return ["codex", "exec"] + args
 
     def parse_line(self, line: str) -> ParsedLine:
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            return ParsedLine(event_type="log")
-
+        obj = json.loads(line)
         if not isinstance(obj, dict):
-            return ParsedLine(event_type="log")
+            raise ValueError("backend output JSON must be an object")
 
         etype = str(obj.get("type", ""))
 

@@ -251,9 +251,9 @@ After a turn ends, process in the following order:
 
 ### Definitions
 
-- **Public event**: an event that crosses the daemon boundary into the persisted event log (`events` table) and the EventBus, becoming visible to external clients (`agentd logs`, `agentd wait --progress`, channels). Anything before this boundary (raw backend records, runtime internal state like `last_result`, debug logs) is not a public event.
+- **Public event**: an event that crosses the daemon boundary into the persisted event log (`events` table) and the EventBus, becoming visible to external clients (`agentd logs`, `agentd wait --progress`, channels). Anything before this boundary (raw backend records, runtime internal state, debug logs) is not a public event.
 - **Canonical schema**: the payload structure defined by this section (§4) for each event type. Each `turn.progress` subtype, the `turn.end` payload, etc. are canonical schemas. Public events MUST use canonical schemas only.
-- **Raw backend event**: the JSON object emitted by a backend CLI on its stdout, in that backend's own private format (e.g., pi's `message_update.assistantMessageEvent`, codex's `item.completed`, claude's `assistant.content`). Raw backend events are inputs to adapter normalization; they MUST NOT be passed through as public event payloads.
+- **Raw backend event**: the JSON object emitted by a backend CLI on its stdout, in that backend's own private format (e.g., pi's `message_update.assistantMessageEvent`, codex's `item.completed`, claude's `assistant.content`). Raw backend events are adapter normalization inputs.
 
 ### Event Types
 
@@ -262,7 +262,7 @@ After a turn ends, process in the following order:
 | `actor.spawned` | actor_id, name(nullable), backend | Actor created |
 | `turn.opened` | turn_id, input snapshot | Scheduler opened turn; input snapshot is the source of truth for opening input |
 | `turn.started` | turn_id, exec_pid | Runtime started processing |
-| `turn.progress` | See below | Minimally normalized progress (canonical schema only) |
+| `turn.progress` | See below | Live progress (text, thinking, tool call) |
 | `turn.end` | outcome, result, error | Sole turn completion signal |
 | `actor.closed` | reason | Actor entered terminal state |
 | `actor.checkpoint.loaded` | | Checkpoint loaded |
@@ -276,9 +276,7 @@ Optional (may not be implemented in v1):
 
 #### `turn.progress` Subtypes
 
-Each backend adapter is responsible for mapping raw output to three subtypes:
-
-Payload is distinguished by the `type` field:
+Each backend adapter is responsible for mapping raw output to normalized, bounded progress events. Progress is for live observation (`logs --follow`, `ps --watch`, `wait --progress`), not for replaying backend raw protocol or carrying complete turn artifacts. Payload `type` MUST be one of:
 
 | type | Meaning | Payload |
 |---|---|---|
@@ -600,7 +598,6 @@ agentd uses two independent transport size limits:
 | `BACKEND_INPUT_MAX` | 16 MiB | runtime ← backend stdout | Hard guard on a single stdout line from an untrusted external process. Lines exceeding this are discarded with a warning (§11). |
 | `AGENTD_FRAME_MAX` | 4 MiB | daemon socket / CLI stdout / channel subprocess readline | Frame limit for agentd's own line-delimited transport, applied uniformly to daemon socket, CLI output, and channel subprocess readers. |
 
-The two limits are not interchangeable: the first defends against unknown backend producers emitting arbitrarily large input; the second bounds agentd's own line-delimited transport (public event stream + aggregate RPC responses).
 
 ### Local Security Model
 
@@ -683,20 +680,6 @@ Model-level invariants are defined in §2. This section defines table structure,
 - `queued`: waiting to be claimed by a turn
 - `claimed`: bound to an opened turn, waiting for that turn to complete
 - `acked`: consumed by a completed turn
-
-#### Message type taxonomy
-
-Three disjoint forms:
-
-| Form | Origin | Examples |
-|---|---|---|
-| bare predicate | peer-to-peer message authored by a user or another actor | `message` |
-| `env.<source>.<event>` | inbound from outside the daemon (channels, webhooks, cron) | `env.telegram.message`, `env.webhook.github.push` |
-| `env.<predicate>` | daemon-internal observation about an actor's turns or relationships | `env.turn_completed` |
-
-Daemon-internal `env.<predicate>` messages are environment observations the daemon delivers on its own — they are not authored by any peer actor.
-
-- **`env.turn_completed`**: emitted to the direct parent's mailbox when a child actor's turn settles. Payload: `actor_id`, `actor_name`, `turn_id`, `outcome`, optional `result`, optional `error`. Delivery: best-effort, at-most-once.
 
 ### Events
 
@@ -782,13 +765,13 @@ Per-backend checkpoint implementations in §10.
 
 ### Common Contract
 
-Each adapter must normalize backend behavior into canonical signals: `turn.started` / `turn.progress` / `turn.end` / checkpoint update. An adapter may notify the runner to update `last_result` via the `ParsedLine.result` field (runtime internal state, orthogonal to `event_type`, not published to the public event stream); the final result is exposed through `turn.end` / `actor.wait` / `actor.status`.
+Each adapter must normalize backend behavior into canonical signals: `turn.started` / `turn.progress` / `turn.end` / checkpoint update. An adapter may pass result text to the runner via the `ParsedLine.result` field; this is a runtime-internal signal, orthogonal to `event_type`, and is not published to the public event stream. The final result is exposed through `turn.end` / `actor.wait` / `actor.status`.
 
 Adapter output rules:
 
-- Adapter MUST emit canonical payloads defined in §4. Raw backend event objects MUST NOT be passed through as public event payloads, even as a fallback for unknown event types.
-- Public event payload MUST NOT contain raw backend objects, full tool output, full turn input, full final result, or cumulative partial content that could be expressed as deltas.
-- Unmapped backend records MUST be either (a) dropped silently, or (b) written to bounded/redacted runtime diagnostic logs only when debug logging is explicitly enabled. They MUST NOT appear in the public event stream.
+- Adapter MUST emit canonical payloads defined in §4 for all public events.
+- Progress payloads are live-observation records (for example text/thinking deltas and tool name/arguments/status). Progress payloads MUST NOT contain raw backend objects, full tool output, full turn input, full final result, or cumulative partial content that could be expressed as deltas.
+- Unmapped backend records are dropped. They MUST NOT appear in the public event stream.
 
 Completion: `turn.end` is the sole turn completion signal. Fallback: only when no explicit terminal event arrives, synthesize `turn.end` based on execution termination + terminal intent.
 
@@ -808,7 +791,7 @@ Channel-specific formatting (e.g., Telegram message structure expansion) is done
 - Command: `pi --mode json -p "<prompt>" [--session <file>] <backend_args>`
 - Output format: NDJSON (`--mode json`)
 - Prompt input: `-p` flag, value is turn input text
-- Completion detection: process exit. Pi emits `turn_end` after each assistant turn (tool-use turn, reply turn, …), so a single `turn_end` does **not** mean the conversation is finished. The adapter uses each `turn_end` to update the runtime's internal `last_result` (extract the latest assistant text via `ParsedLine.result`, with `event_type="log"`; the raw `turn_end` object MUST NOT be forwarded as a public payload), and lets the process continue until EOF. The runner's generic "no explicit `turn.end` → synthesize on process exit" fallback handles completion.
+- Completion detection: process exit. Pi emits `turn_end` after each assistant turn (tool-use turn, reply turn, …), so a single `turn_end` does **not** mean the conversation is finished. The adapter extracts the latest assistant text through `ParsedLine.result` (with `event_type="log"`) and lets the process continue until EOF; the raw `turn_end` object MUST NOT be forwarded as a public payload. The runner's generic "no explicit `turn.end` → synthesize on process exit" fallback handles completion.
 - Progress mapping: pi's primary streaming event is `message_update` (wrapper); the adapter extracts `assistantMessageEvent.type` (`thinking_start`/`thinking_delta` → `thinking`, `text_delta` → `text`, `tool_use_start`/`tool_use_end` → `tool_call`). Standalone `tool_execution_start`/`tool_execution_end` events are also mapped to `tool_call` (using `toolName`/`args` fields).
 - Checkpoint: `{session_id, session_cwd, session_timestamp}` → constructs exact file path `<session_dir>/--<cwd_slug>--/<ts_slug>_<session_id>.jsonl` → `--session <file>`. Falls back to error if checkpoint exists but file is not found (no glob).
 - Capability: `supports_steer=false`
@@ -894,7 +877,7 @@ Channels can run standalone or be supervised by the daemon via the `channels` co
 Each adapter does two things:
 
 - **Inbound**: platform message → `agentd emit <actor> --type env.<platform> --payload '{...}'` (adapter-layer logic: emit first, fallback to spawn if actor doesn't exist; this is the adapter's notify pattern, not daemon behavior — daemon's emit returns `not_found` for non-existent actors)
-- **Outbound**: `agentd logs --follow` to monitor actor progress → push back to platform (typing indicator, text, results)
+- **Outbound**: monitor actor progress/state → push platform-appropriate updates (typing indicator, progress, failures)
 
 Adapter is responsible for platform-specific logic (message format, length limits, Markdown compatibility, permission checking). agentd is unaware of platform details.
 
@@ -904,9 +887,7 @@ Channel readline requirements:
 - Recommended implementation value: 4 MiB (aligns with `AGENTD_FRAME_MAX` and the built-in `RpcClient`).
 - Per-platform splitting, attaching, and formatting of the result (e.g., Telegram message limits, file attachments) is the channel adapter's responsibility.
 
-Result delivery:
-
-- The full result is not in the public event stream payload; channels retrieve it via the `agentd wait` command's RPC ok response or `actor.status include_result=true` from the authoritative store.
+Result delivery is channel-specific. Channels may relay final results, or the agent may reply directly through a channel skill (as the Telegram reference adapter expects).
 
 ### Transport Modes
 
@@ -940,7 +921,7 @@ One of v1's deliverables. Built-in adapter (`agentd.channels.telegram`), using l
 2. Serialize processing per `chat_id` (no concurrency within same chat)
 3. Message → notify pattern: try `agentd emit` first, fallback to `agentd spawn` if actor doesn't exist
 4. `agentd wait <actor> --progress` to stream progress events, push to Telegram in real time
-5. After turn ends, send result back to Telegram
+5. After turn ends, report failure/stop if needed; successful replies are sent by the agent via the Telegram skill
 
 #### Progress Display
 

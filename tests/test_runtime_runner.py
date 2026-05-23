@@ -7,6 +7,7 @@ from agentd.runtime.backends.codex import CodexAdapter
 from agentd.runtime.backends.pi import PiAdapter
 from agentd.runtime.runner import (
     STREAM_DRAIN_CHUNK_SIZE,
+    _append_backend_record_too_large_error,
     _drain_stream,
     _read_stderr_capped,
     _readline_resilient,
@@ -119,6 +120,16 @@ def test_resolve_process_outcome_fails_without_result_or_turn_end():
 
     assert outcome == TurnOutcome.FAILED
     assert error == "no turn.end received"
+
+
+def test_backend_record_too_large_prefix_is_preserved_when_appending_error():
+    error = _append_backend_record_too_large_error(
+        "exit code 1",
+        {"dropped_lines": 2, "dropped_bytes": 123},
+    )
+
+    assert error.startswith("exit code 1; backend_record_too_large: ")
+    assert "dropped 2 oversized stdout line(s)" in error
 
 
 def test_pi_turn_end_does_not_leak_raw_payload():

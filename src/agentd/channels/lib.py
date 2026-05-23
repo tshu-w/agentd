@@ -13,7 +13,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any
 
-from agentd.protocol import PublicErrorCode
+from agentd.protocol import AGENTD_FRAME_MAX, PublicErrorCode
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +256,7 @@ async def wait_for_actor(
         str(since_seq),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        limit=4 * 1024 * 1024,
+        limit=AGENTD_FRAME_MAX,
         env=_agentd_env(),
     )
 

@@ -494,7 +494,7 @@ async def handle_command(chat_id: str, text: str, message: dict) -> bool:
             "/stop — stop current actor\n"
             "/status — actor info\n"
             "/logs — recent actor activity\n"
-            "/restart — restart adapter process\n"
+            "/restart — restart Telegram channel\n"
             "/help — this message",
             mid,
         )
@@ -524,7 +524,7 @@ async def handle_command(chat_id: str, text: str, message: dict) -> bool:
             await send_text(chat_id, f"❌ Stop failed: {e}", mid)
         return True
     if cmd == "/restart":
-        await send_text(chat_id, "♻️ Restarting adapter…", mid)
+        await send_text(chat_id, "♻️ Restarting Telegram channel…", mid)
         await asyncio.sleep(0.5)
         os._exit(0)
 

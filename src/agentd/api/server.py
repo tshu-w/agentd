@@ -15,6 +15,7 @@ import signal
 
 from agentd.config import AgentDConfig
 from agentd.protocol import (
+    AGENTD_FRAME_MAX,
     INTERNAL_ERROR,
     INVALID_REQUEST,
     PARSE_ERROR,
@@ -81,6 +82,7 @@ class Daemon:
         self._server = await asyncio.start_unix_server(
             self._handle_connection,
             path=str(sock_path),
+            limit=AGENTD_FRAME_MAX,
         )
         os.chmod(str(sock_path), 0o600)
         logger.info("listening on %s", sock_path)

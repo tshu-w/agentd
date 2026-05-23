@@ -74,6 +74,7 @@ async def _readline_resilient(
     reader: asyncio.StreamReader,
     *,
     turn_id: str,
+    backend_name: str | None = None,
     stats: dict[str, int] | None = None,
 ) -> bytes | None:
     """Read one line, skipping oversized records without aborting the turn.
@@ -91,8 +92,9 @@ async def _readline_resilient(
         except asyncio.LimitOverrunError as exc:
             dropped = await _discard_overlong_line(reader, exc.consumed)
             logger.warning(
-                "dropped oversized backend output line for turn=%s bytes=%d",
+                "dropped oversized backend output line for turn=%s backend=%s bytes=%d",
                 turn_id,
+                backend_name or "unknown",
                 dropped,
             )
             if stats is not None:
@@ -124,6 +126,19 @@ def _resolve_process_outcome(
     if got_turn_end or last_result is not None:
         return TurnOutcome.SUCCEEDED, None
     return TurnOutcome.FAILED, "no turn.end received"
+
+
+def _append_backend_record_too_large_error(
+    error: str | None,
+    stdout_stats: dict[str, int],
+) -> str:
+    diag = (
+        f"dropped {stdout_stats['dropped_lines']} oversized stdout "
+        f"line(s) ({stdout_stats['dropped_bytes']} bytes) exceeding "
+        f"{STREAM_READ_LIMIT} bytes (BACKEND_INPUT_MAX)"
+    )
+    prefix = f"backend_record_too_large: {diag}"
+    return prefix if not error else f"{error}; {prefix}"
 
 
 async def _read_stderr_capped(
@@ -372,7 +387,10 @@ class Runtime:
                 assert process.stdout is not None
                 while True:
                     line_bytes = await _readline_resilient(
-                        process.stdout, turn_id=turn_id, stats=stdout_stats
+                        process.stdout,
+                        turn_id=turn_id,
+                        backend_name=backend_name,
+                        stats=stdout_stats,
                     )
                     if line_bytes is None:
                         break
@@ -517,16 +535,7 @@ class Runtime:
         # the root cause (BACKEND_INPUT_MAX exceeded) is not masked by a
         # generic exit-code / timeout / no-turn-end message.
         if outcome == TurnOutcome.FAILED and stdout_stats["dropped_lines"] > 0:
-            diag = (
-                f"dropped {stdout_stats['dropped_lines']} oversized stdout "
-                f"line(s) ({stdout_stats['dropped_bytes']} bytes) exceeding "
-                f"{STREAM_READ_LIMIT} bytes (BACKEND_INPUT_MAX)"
-            )
-            error = (
-                f"backend_record_too_large: {diag}"
-                if not error
-                else f"{error}; {diag}"
-            )
+            error = _append_backend_record_too_large_error(error, stdout_stats)
 
         await self.scheduler.on_turn_completed(
             turn_id,
