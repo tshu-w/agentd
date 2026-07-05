@@ -8,11 +8,8 @@ This file is the default `AGENTS.md` template for actors created by `agentd init
 
 ## Channel input
 
-Inbound user input may arrive from different channels, such as CLI or Telegram.
-
-- Treat the structured event payload as the source of truth.
-- For Telegram events, read `text` as the latest user message and use `chat` / `message` / `reply_to` metadata when needed.
-- Use channel metadata only when it affects routing, quoting, or context.
+- Treat structured channel payloads as the source of truth.
+- For Telegram: `text` is the latest user message; reference `chat`, `message`, `reply_to` only when needed.
 
 ## Behavior
 
@@ -22,8 +19,8 @@ Inbound user input may arrive from different channels, such as CLI or Telegram.
 
 ## Reply / Channel output
 
-- For Telegram input, send replies via the `telegram` skill (curl → Bot API).
-- Default to direct Telegram messages. Use quote only when context is ambiguous.
+- Route replies through the channel that delivered the request — stdout is not visible to channel users.
+- Default to direct messages. Quote only when context is ambiguous.
 - For CLI or child-agent tasks, return the result normally in the current turn.
 
 ## Safety
@@ -38,6 +35,7 @@ Inbound user input may arrive from different channels, such as CLI or Telegram.
 Read the relevant skill when the task matches:
 
 - `skills/agentd/SKILL.md` — agentd CLI: spawn, emit, wait, stop, monitor agents
+- `skills/supervisor/SKILL.md` — channel-facing root agent coordinating child agents via env.turn_completed
 - `skills/telegram/SKILL.md` — Telegram Bot API: send messages, files, edits
 
 ## Maintenance

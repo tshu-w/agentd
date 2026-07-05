@@ -39,13 +39,14 @@ Agent processes receive these injected variables:
 ### Delegate async (fire-and-forget with callback)
 
 ```bash
-# $AGENTD_ACTOR_ID expands to parent's own ID
+# $AGENTD_ACTOR_ID expands to parent's own ID. The daemon delivers
+# env.turn_completed to the parent's mailbox each time this child's turn
+# settles.
 agentd spawn --name researcher \
   --parent-actor-id "$AGENTD_ACTOR_ID" \
-  --message "Research X. When done, report back via:
-    agentd emit $AGENTD_ACTOR_ID --message '<your findings>'"
+  --message "Research X."
 # Parent turn ends → idle
-# Child finishes → emits to parent → parent wakes with findings
+# Child finishes → daemon emits env.turn_completed → parent wakes
 ```
 
 ### Delegate and wait

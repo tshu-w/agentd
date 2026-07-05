@@ -681,6 +681,18 @@ Daemon 启动时对残留状态做确定性收敛：
 - `claimed`：已绑定到某个已打开的 turn，等待该 turn 完成
 - `acked`：已被完成的 turn 消费
 
+#### Message type taxonomy
+
+| 形式 | 来源 | 示例 |
+|---|---|---|
+| bare predicate | 用户或其他 actor 发出的 peer-to-peer message | `message` |
+| `env.<source>.<event>` | daemon 外部输入 | `env.telegram.message`、`env.webhook.github.push` |
+| `env.<predicate>` | daemon 内部观察 | `env.turn_completed` |
+
+Daemon-internal `env.<predicate>` message 是 daemon 投递的环境观察，不是某个 peer actor 发出的消息。
+
+- **`env.turn_completed`**：direct child 的 turn settle 时投递到 parent mailbox。Payload：`actor_id`、`actor_name`、`turn_id`、`outcome`、可选 final text `result`、可选 `error`。Delivery：best-effort、at-most-once。daemon 重启 reconcile 强制失败的 turn（`error: "daemon restarted"`）同样会通知；该路径只入队不唤醒，parent 由 reconcile 的 idle-wakeup 阶段唤醒。
+
 ### Events
 
 Append-only 日志。`seq` 全局单调递增，提供跨 actor 的全局排序。

@@ -338,3 +338,380 @@ async def test_stop_pending_turn(env):
     turn_ends = [e for e in events if e["event_type"] == "turn.end"]
     assert len(turn_ends) == 1
     assert turn_ends[0]["payload"]["outcome"] == "interrupted"
+
+
+# ---------------------------------------------------------------------------
+# Child → parent notification (env.turn_completed convention)
+# ---------------------------------------------------------------------------
+
+
+def _all_messages(store, actor_id: str) -> list[dict]:
+    """Return every mailbox message for an actor regardless of state."""
+    rows = (
+        store.db.connect()
+        .execute(
+            "SELECT * FROM mailbox WHERE actor_id = ? ORDER BY created_at, message_id",
+            (actor_id,),
+        )
+        .fetchall()
+    )
+    return [store._msg_dict(r) for r in rows]
+
+
+@pytest.mark.asyncio
+async def test_notify_parent_on_success(env):
+    """Successful child turn.end auto-emits env.turn_completed and wakes the parent."""
+    store, _bus, sch = env
+
+    parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
+    child = store.create_actor(
+        name="worker",
+        scope_id=parent["actor_id"],
+        backend="pi",
+        parent_actor_id=parent["actor_id"],
+    )
+
+    # Open + end a child turn directly (no runtime needed)
+    await sch.emit(actor_id=child["actor_id"], msg_type="message", msg_payload={"text": "go"})
+    turn = store.get_active_turn(child["actor_id"])
+    await sch.on_turn_completed(turn["turn_id"], outcome=TurnOutcome.SUCCEEDED, result="done.")
+
+    # Parent should have received env.turn_completed in its mailbox (any state).
+    msgs = _all_messages(store, parent["actor_id"])
+    turn_ends = [m for m in msgs if m["message_type"] == "env.turn_completed"]
+    assert len(turn_ends) == 1
+    payload = turn_ends[0]["payload"]
+    assert payload["actor_id"] == child["actor_id"]
+    assert payload["actor_name"] == "worker"
+    assert payload["outcome"] == "succeeded"
+    assert payload["result"] == "done."
+    assert "error" not in payload
+    # Parent must have actually woken: emit on IDLE → _try_open_turn → ACTIVE.
+    parent_after = store.get_actor(parent["actor_id"])
+    assert parent_after["state"] == "active"
+    assert store.get_active_turn(parent["actor_id"]) is not None
+
+
+@pytest.mark.asyncio
+async def test_notify_parent_on_failure(env):
+    """Failed child turn still notifies parent so supervisor can react."""
+    store, _bus, sch = env
+
+    parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
+    child = store.create_actor(
+        name="worker",
+        scope_id=parent["actor_id"],
+        backend="pi",
+        parent_actor_id=parent["actor_id"],
+    )
+    await sch.emit(actor_id=child["actor_id"], msg_type="message", msg_payload={"text": "go"})
+    turn = store.get_active_turn(child["actor_id"])
+    await sch.on_turn_completed(turn["turn_id"], outcome=TurnOutcome.FAILED, error="boom")
+
+    msgs = _all_messages(store, parent["actor_id"])
+    turn_ends = [m for m in msgs if m["message_type"] == "env.turn_completed"]
+    assert len(turn_ends) == 1
+    payload = turn_ends[0]["payload"]
+    assert payload["outcome"] == "failed"
+    assert payload["error"] == "boom"
+    assert "result" not in payload
+
+
+@pytest.mark.asyncio
+async def test_notify_suppressed_on_user_termination(env):
+    """User-initiated stop/cancel should not generate turn_completed noise."""
+    store, _bus, sch = env
+
+    parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
+    child = store.create_actor(
+        name="worker",
+        scope_id=parent["actor_id"],
+        backend="pi",
+        parent_actor_id=parent["actor_id"],
+    )
+    await sch.emit(actor_id=child["actor_id"], msg_type="message", msg_payload={"text": "go"})
+    turn = store.get_active_turn(child["actor_id"])
+    await sch.on_turn_completed(turn["turn_id"], outcome=TurnOutcome.INTERRUPTED)
+
+    msgs = _all_messages(store, parent["actor_id"])
+    assert [m for m in msgs if m["message_type"] == "env.turn_completed"] == []
+
+
+@pytest.mark.asyncio
+async def test_notify_skipped_when_parent_closed(env):
+    """Closed parent must not receive notifications."""
+    store, _bus, sch = env
+
+    parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
+    child = store.create_actor(
+        name="worker",
+        scope_id=parent["actor_id"],
+        backend="pi",
+        parent_actor_id=parent["actor_id"],
+    )
+
+    await sch.emit(actor_id=child["actor_id"], msg_type="message", msg_payload={"text": "go"})
+    turn = store.get_active_turn(child["actor_id"])
+
+    # Race: parent gets closed (without cascade) between child turn opening and
+    # turn.end firing. The notification path must silently skip.
+    store.db.connect().execute(
+        "UPDATE actors SET state = 'closed' WHERE actor_id = ?",
+        (parent["actor_id"],),
+    )
+    store.db.connect().commit()
+
+    await sch.on_turn_completed(turn["turn_id"], outcome=TurnOutcome.SUCCEEDED, result="done")
+
+    msgs = _all_messages(store, parent["actor_id"])
+    assert [m for m in msgs if m["message_type"] == "env.turn_completed"] == []
+
+
+@pytest.mark.asyncio
+async def test_notify_delivers_final_text_result_to_parent(env):
+    """Child final text result is delivered with the completion notification."""
+    store, _bus, sch = env
+    parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
+    child = store.create_actor(
+        name="worker",
+        scope_id=parent["actor_id"],
+        backend="pi",
+        parent_actor_id=parent["actor_id"],
+    )
+    await sch.emit(actor_id=child["actor_id"], msg_type="message", msg_payload={"text": "go"})
+    turn = store.get_active_turn(child["actor_id"])
+
+    result = "child finished with findings"
+    await sch.on_turn_completed(turn["turn_id"], outcome=TurnOutcome.SUCCEEDED, result=result)
+
+    msgs = _all_messages(store, parent["actor_id"])
+    payload = next(m["payload"] for m in msgs if m["message_type"] == "env.turn_completed")
+    assert payload["result"] == result
+
+
+@pytest.mark.asyncio
+async def test_notify_queues_when_parent_active(env):
+    """If parent is mid-turn, env.turn_completed queues for the next turn."""
+    store, _bus, sch = env
+
+    parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
+    child = store.create_actor(
+        name="worker",
+        scope_id=parent["actor_id"],
+        backend="pi",
+        parent_actor_id=parent["actor_id"],
+    )
+
+    # Force parent ACTIVE: emit drives IDLE → ACTIVE with a turn pending.
+    await sch.emit(actor_id=parent["actor_id"], msg_type="message", msg_payload={"text": "hi"})
+    parent_state = store.get_actor(parent["actor_id"])
+    assert parent_state["state"] == "active"
+
+    # Run a child turn to completion.
+    await sch.emit(actor_id=child["actor_id"], msg_type="message", msg_payload={"text": "go"})
+    turn = store.get_active_turn(child["actor_id"])
+    await sch.on_turn_completed(turn["turn_id"], outcome=TurnOutcome.SUCCEEDED, result="r")
+
+    msgs = _all_messages(store, parent["actor_id"])
+    turn_ends = [m for m in msgs if m["message_type"] == "env.turn_completed"]
+    assert len(turn_ends) == 1
+    # Parent stays ACTIVE (its earlier turn is still open).
+    assert store.get_actor(parent["actor_id"])["state"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_notify_does_not_propagate_to_grandparent(env):
+    """Notifications target the immediate parent only — no transitive forwarding."""
+    store, _bus, sch = env
+
+    gp = store.create_actor(name="gp", scope_id=ROOT_SCOPE, backend="pi")
+    parent = store.create_actor(
+        name="parent",
+        scope_id=gp["actor_id"],
+        backend="pi",
+        parent_actor_id=gp["actor_id"],
+    )
+    child = store.create_actor(
+        name="child",
+        scope_id=parent["actor_id"],
+        backend="pi",
+        parent_actor_id=parent["actor_id"],
+    )
+
+    await sch.emit(actor_id=child["actor_id"], msg_type="message", msg_payload={"text": "go"})
+    turn = store.get_active_turn(child["actor_id"])
+    await sch.on_turn_completed(turn["turn_id"], outcome=TurnOutcome.SUCCEEDED, result="ok")
+
+    parent_msgs = _all_messages(store, parent["actor_id"])
+    gp_msgs = _all_messages(store, gp["actor_id"])
+    assert any(m["message_type"] == "env.turn_completed" for m in parent_msgs)
+    assert all(m["message_type"] != "env.turn_completed" for m in gp_msgs)
+
+
+@pytest.mark.asyncio
+async def test_root_actor_does_not_self_emit(env):
+    """Actors without a parent never trigger env.turn_completed."""
+    store, _bus, sch = env
+
+    a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
+    await sch.emit(actor_id=a["actor_id"], msg_type="message", msg_payload={"text": "go"})
+    turn = store.get_active_turn(a["actor_id"])
+    await sch.on_turn_completed(turn["turn_id"], outcome=TurnOutcome.SUCCEEDED, result="hi")
+
+    msgs = _all_messages(store, a["actor_id"])
+    assert [m for m in msgs if m["message_type"] == "env.turn_completed"] == []
+
+
+@pytest.mark.asyncio
+async def test_notify_survives_capacity_pressure(env):
+    """Notification path must work even when global worker capacity is saturated.
+
+    The parent's wakeup turn may stay pending (no dispatch slot), but the
+    mailbox message must still land and the parent must transition to ACTIVE.
+    """
+    store, _bus, sch = env
+    sch.config.limits.max_total_workers = 1
+    rt = _FakeRuntime()
+    sch.set_runtime(rt)
+
+    parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
+    child = store.create_actor(
+        name="worker",
+        scope_id=parent["actor_id"],
+        backend="pi",
+        parent_actor_id=parent["actor_id"],
+    )
+
+    # Saturate the single dispatch slot with an unrelated running turn.
+    blocker = store.create_actor(name="blocker", scope_id=ROOT_SCOPE, backend="pi")
+    await sch.emit(actor_id=blocker["actor_id"], msg_type="message", msg_payload={"text": "hold"})
+    assert sch._running_count == 1
+
+    # Run the child turn to completion (manually, since we're not exercising
+    # runtime here — the open path counts toward _running_count, then
+    # on_turn_completed releases it before notify runs).
+    await sch.emit(actor_id=child["actor_id"], msg_type="message", msg_payload={"text": "go"})
+    turn = store.get_active_turn(child["actor_id"])
+    await sch.on_turn_completed(turn["turn_id"], outcome=TurnOutcome.SUCCEEDED, result="ok")
+
+    # Mailbox got the notification.
+    msgs = _all_messages(store, parent["actor_id"])
+    assert any(m["message_type"] == "env.turn_completed" for m in msgs)
+    # Parent woke up to ACTIVE; its turn may be running (slot was released by
+    # the child completing) or pending depending on scheduling order, but the
+    # actor itself must not be stuck IDLE with a queued message.
+    assert store.get_actor(parent["actor_id"])["state"] == "active"
+    assert store.get_active_turn(parent["actor_id"]) is not None
+    assert sch._running_count == 1
+
+
+@pytest.mark.asyncio
+async def test_notify_exception_does_not_block_scheduler(env, monkeypatch):
+    """A failed parent notification must not break on_turn_completed.
+
+    The child's turn.end is already persisted; swallowing the notification
+    exception preserves the global liveness invariant that
+    `_try_schedule_waiting` always runs.
+    """
+    store, _bus, sch = env
+
+    parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
+    child = store.create_actor(
+        name="worker",
+        scope_id=parent["actor_id"],
+        backend="pi",
+        parent_actor_id=parent["actor_id"],
+    )
+    await sch.emit(actor_id=child["actor_id"], msg_type="message", msg_payload={"text": "go"})
+    turn = store.get_active_turn(child["actor_id"])
+
+    # Patch only the parent-notify call; let other emits work normally.
+    original_emit = sch.emit
+
+    async def emit_router(**kwargs):
+        if kwargs.get("msg_type") == "env.turn_completed":
+            raise RuntimeError("simulated notify failure")
+        return await original_emit(**kwargs)
+
+    monkeypatch.setattr(sch, "emit", emit_router)
+
+    schedule_calls: list[bool] = []
+    original_try_schedule = sch._try_schedule_waiting
+
+    async def tracking_try_schedule():
+        schedule_calls.append(True)
+        return await original_try_schedule()
+
+    monkeypatch.setattr(sch, "_try_schedule_waiting", tracking_try_schedule)
+
+    # Must not raise — exception swallowed inside _notify_parent_turn_completed.
+    await sch.on_turn_completed(turn["turn_id"], outcome=TurnOutcome.SUCCEEDED, result="ok")
+    assert schedule_calls
+
+    # Child completed cleanly: turn ended, actor idle, no env.turn_completed
+    # in parent (because emit was the failing call).
+    child_after = store.get_actor(child["actor_id"])
+    assert child_after["state"] == "idle"
+    assert store.get_active_turn(child["actor_id"]) is None
+    parent_msgs = _all_messages(store, parent["actor_id"])
+    assert all(m["message_type"] != "env.turn_completed" for m in parent_msgs)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_notifies_parent_of_restart_failure(env):
+    """Turns force-failed by daemon-restart reconcile must still notify the parent."""
+    store, _bus, sch = env
+
+    parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
+    child = store.create_actor(
+        name="worker",
+        scope_id=parent["actor_id"],
+        backend="pi",
+        parent_actor_id=parent["actor_id"],
+    )
+    store.add_message(child["actor_id"], "message", {"text": "go"})
+    turn, _msg = store.open_turn_atomic(child["actor_id"])
+    store.transition_turn(turn["turn_id"], TurnState.RUNNING, exec_pid=999999)
+
+    await sch.reconcile()
+
+    msgs = _all_messages(store, parent["actor_id"])
+    turn_ends = [m for m in msgs if m["message_type"] == "env.turn_completed"]
+    assert len(turn_ends) == 1
+    payload = turn_ends[0]["payload"]
+    assert payload["actor_id"] == child["actor_id"]
+    assert payload["outcome"] == "failed"
+    assert payload["error"] == "daemon restarted"
+    # Child settled cleanly.
+    assert store.get_actor(child["actor_id"])["state"] == "idle"
+    # Reconcile step 4 (idle wakeup) opened a turn for the queued notification.
+    assert store.get_actor(parent["actor_id"])["state"] == "active"
+    assert store.get_active_turn(parent["actor_id"]) is not None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_notify_skips_closed_parent(env):
+    """Enqueue-only notify path must tolerate a closed parent."""
+    store, _bus, sch = env
+
+    parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
+    child = store.create_actor(
+        name="worker",
+        scope_id=parent["actor_id"],
+        backend="pi",
+        parent_actor_id=parent["actor_id"],
+    )
+    store.add_message(child["actor_id"], "message", {"text": "go"})
+    turn, _msg = store.open_turn_atomic(child["actor_id"])
+    store.transition_turn(turn["turn_id"], TurnState.RUNNING, exec_pid=999999)
+
+    store.db.connect().execute(
+        "UPDATE actors SET state = 'closed' WHERE actor_id = ?",
+        (parent["actor_id"],),
+    )
+    store.db.connect().commit()
+
+    await sch.reconcile()
+
+    msgs = _all_messages(store, parent["actor_id"])
+    assert [m for m in msgs if m["message_type"] == "env.turn_completed"] == []
