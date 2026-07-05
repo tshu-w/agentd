@@ -691,7 +691,7 @@ Daemon 启动时对残留状态做确定性收敛：
 
 Daemon-internal `env.<predicate>` message 是 daemon 投递的环境观察，不是某个 peer actor 发出的消息。
 
-- **`env.turn_completed`**：direct child 的 turn settle 时投递到 parent mailbox。Payload：`actor_id`、`actor_name`、`turn_id`、`outcome`、可选 final text `result`、可选 `error`。Delivery：best-effort、at-most-once。
+- **`env.turn_completed`**：direct child 的 turn settle 时投递到 parent mailbox。Payload：`actor_id`、`actor_name`、`turn_id`、`outcome`、可选 final text `result`、可选 `error`。Delivery：best-effort、at-most-once。daemon 重启 reconcile 强制失败的 turn（`error: "daemon restarted"`）同样会通知；该路径只入队不唤醒，parent 由 reconcile 的 idle-wakeup 阶段唤醒。
 
 ### Events
 

@@ -462,6 +462,7 @@ class Scheduler:
         outcome: TurnOutcome,
         result: str | None,
         error: str | None,
+        wake: bool = True,
     ) -> None:
         """Auto-emit env.turn_completed to the parent's mailbox on child turn.end.
 
@@ -482,6 +483,11 @@ class Scheduler:
         child's turn.end is already persisted; missing a wakeup is recoverable
         by the supervisor checking `agentd ps`, missing global scheduling is
         not.
+
+        ``wake=False`` enqueues without opening a turn on the parent. Reconcile
+        needs this: waking mid-reconcile would create a fresh pending turn that
+        step 3 (pending-turn redispatch) picks up again → double dispatch. Its
+        step 4 idle-wakeup pass delivers the queued notification instead.
         """
         if outcome in (TurnOutcome.INTERRUPTED, TurnOutcome.CANCELED):
             return
@@ -498,11 +504,24 @@ class Scheduler:
             payload["error"] = error
 
         try:
-            await self.emit(
-                actor_id=parent_actor_id,
-                msg_type="env.turn_completed",
-                msg_payload=payload,
-            )
+            if wake:
+                await self.emit(
+                    actor_id=parent_actor_id,
+                    msg_type="env.turn_completed",
+                    msg_payload=payload,
+                )
+            else:
+                parent = self.store.get_actor(parent_actor_id)
+                if parent is None or parent["state"] == ActorState.CLOSED.value:
+                    logger.debug(
+                        "parent %s closed; dropping turn_completed notification for %s",
+                        parent_actor_id,
+                        child["actor_id"],
+                    )
+                    return
+                self.store.add_message(
+                    parent_actor_id, "env.turn_completed", payload
+                )
         except SchedulerError as exc:
             if exc.error_type == "actor_closed":
                 # Expected race: parent closed between turn.end and notify.
@@ -765,6 +784,17 @@ class Scheduler:
                 turn_id=turn["turn_id"],
             )
             logger.info("failed orphan turn=%s actor=%s", turn["turn_id"], actor_id)
+            actor = self.store.get_actor(actor_id)
+            if actor and actor.get("parent_actor_id"):
+                await self._notify_parent_turn_completed(
+                    parent_actor_id=actor["parent_actor_id"],
+                    child=actor,
+                    turn_id=turn["turn_id"],
+                    outcome=TurnOutcome.FAILED,
+                    result=None,
+                    error="daemon restarted",
+                    wake=False,
+                )
 
         # 3. Reschedule pending turns (recover claimed message, track for acking)
         for turn in self.store.list_pending_turns():

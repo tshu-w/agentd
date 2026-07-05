@@ -655,3 +655,63 @@ async def test_notify_exception_does_not_block_scheduler(env, monkeypatch):
     assert store.get_active_turn(child["actor_id"]) is None
     parent_msgs = _all_messages(store, parent["actor_id"])
     assert all(m["message_type"] != "env.turn_completed" for m in parent_msgs)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_notifies_parent_of_restart_failure(env):
+    """Turns force-failed by daemon-restart reconcile must still notify the parent."""
+    store, _bus, sch = env
+
+    parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
+    child = store.create_actor(
+        name="worker",
+        scope_id=parent["actor_id"],
+        backend="pi",
+        parent_actor_id=parent["actor_id"],
+    )
+    store.add_message(child["actor_id"], "message", {"text": "go"})
+    turn, _msg = store.open_turn_atomic(child["actor_id"])
+    store.transition_turn(turn["turn_id"], TurnState.RUNNING, exec_pid=999999)
+
+    await sch.reconcile()
+
+    msgs = _all_messages(store, parent["actor_id"])
+    turn_ends = [m for m in msgs if m["message_type"] == "env.turn_completed"]
+    assert len(turn_ends) == 1
+    payload = turn_ends[0]["payload"]
+    assert payload["actor_id"] == child["actor_id"]
+    assert payload["outcome"] == "failed"
+    assert payload["error"] == "daemon restarted"
+    # Child settled cleanly.
+    assert store.get_actor(child["actor_id"])["state"] == "idle"
+    # Reconcile step 4 (idle wakeup) opened a turn for the queued notification.
+    assert store.get_actor(parent["actor_id"])["state"] == "active"
+    assert store.get_active_turn(parent["actor_id"]) is not None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_notify_skips_closed_parent(env):
+    """Enqueue-only notify path must tolerate a closed parent."""
+    store, _bus, sch = env
+
+    parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
+    child = store.create_actor(
+        name="worker",
+        scope_id=parent["actor_id"],
+        backend="pi",
+        parent_actor_id=parent["actor_id"],
+    )
+    store.add_message(child["actor_id"], "message", {"text": "go"})
+    turn, _msg = store.open_turn_atomic(child["actor_id"])
+    store.transition_turn(turn["turn_id"], TurnState.RUNNING, exec_pid=999999)
+
+    store.db.connect().execute(
+        "UPDATE actors SET state = 'closed' WHERE actor_id = ?",
+        (parent["actor_id"],),
+    )
+    store.db.connect().commit()
+
+    await sch.reconcile()
+
+    msgs = _all_messages(store, parent["actor_id"])
+    assert [m for m in msgs if m["message_type"] == "env.turn_completed"] == []

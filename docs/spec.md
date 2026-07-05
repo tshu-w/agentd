@@ -691,7 +691,7 @@ Model-level invariants are defined in §2. This section defines table structure,
 
 Daemon-internal `env.<predicate>` messages are environment observations delivered by the daemon, not authored by a peer actor.
 
-- **`env.turn_completed`**: emitted to the direct parent's mailbox when a child actor's turn settles. Payload: `actor_id`, `actor_name`, `turn_id`, `outcome`, optional final text `result`, optional `error`. Delivery: best-effort, at-most-once.
+- **`env.turn_completed`**: emitted to the direct parent's mailbox when a child actor's turn settles. Payload: `actor_id`, `actor_name`, `turn_id`, `outcome`, optional final text `result`, optional `error`. Delivery: best-effort, at-most-once. Turns force-failed by daemon-restart reconciliation (`error: "daemon restarted"`) also notify; that path only enqueues, and the parent wakes via reconcile's idle-wakeup pass.
 
 ### Events
 
