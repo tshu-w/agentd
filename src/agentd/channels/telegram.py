@@ -503,7 +503,7 @@ async def handle_command(chat_id: str, text: str, message: dict) -> bool:
         name = root_actor_name(chat_id)
         try:
             result = agentd_status()
-            active = result.get("daemon", {}).get("status", {}).get("active_actors", "?")
+            active = result.get("status", {}).get("active_actors", "?")
             await send_text(chat_id, f"🏷 Name: `{name}`\n🤖 Daemon: running ({active} active)", mid)
         except Exception:
             await send_text(chat_id, f"🏷 Name: `{name}`\n🤖 Daemon: unreachable", mid)
