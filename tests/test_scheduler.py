@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from agentd.config import AgentDConfig
-from agentd.protocol import ROOT_SCOPE, TurnOutcome, TurnState
+from agentd.protocol import ROOT_SCOPE, EventType, TurnOutcome, TurnState
 from agentd.scheduler.event_bus import EventBus
 from agentd.scheduler.scheduler import Scheduler
 from agentd.store.db import Database
@@ -715,3 +715,19 @@ async def test_reconcile_notify_skips_closed_parent(env):
 
     msgs = _all_messages(store, parent["actor_id"])
     assert [m for m in msgs if m["message_type"] == "env.turn_completed"] == []
+
+
+@pytest.mark.asyncio
+async def test_emit_event_seq_anchors_before_own_events(env):
+    """Replaying events > event_seq must include this emit's own turn.opened."""
+    store, _bus, sch = env
+
+    a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
+    # Unrelated actor appends an event first so max_seq > 0.
+    other = store.create_actor(name="other", scope_id=ROOT_SCOPE, backend="pi")
+    store.append_event(other["actor_id"], EventType.ACTOR_SPAWNED, {})
+
+    res = await sch.emit(actor_id=a["actor_id"], msg_type="message", msg_payload={"text": "hi"})
+
+    events = store.list_events(a["actor_id"], since_seq=res["event_seq"])
+    assert any(e["event_type"] == "turn.opened" for e in events)

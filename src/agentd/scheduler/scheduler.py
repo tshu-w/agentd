@@ -200,6 +200,14 @@ class Scheduler:
             # v1: no backend supports steer
             raise SchedulerError("conflict", "steer not supported by backend")
 
+        # Anchor the replay cursor BEFORE producing any events of our own:
+        # callers pass event_seq as since_seq to wait/logs, and events with
+        # seq > since_seq are delivered. Anchoring after _try_open_turn would
+        # exclude this emit's own turn.opened (plus anything appended
+        # concurrently) from replay — under-delivery. Over-delivery of
+        # unrelated events is harmless: followers filter by actor.
+        seq = self.store.get_max_seq()
+
         # Store message in mailbox
         msg = self.store.add_message(actor_id, msg_type, msg_payload)
 
@@ -215,7 +223,6 @@ class Scheduler:
             turn_info = await self._try_open_turn(actor_id)
             woke = turn_info is not None
 
-        seq = self.store.get_max_seq()
         return {
             "actor_id": actor_id,
             "delivery_mode": resolved_mode.value,
