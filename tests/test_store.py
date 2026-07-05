@@ -5,7 +5,7 @@ import sqlite3
 import pytest
 
 from agentd.protocol import ROOT_SCOPE, ActorState, TurnOutcome, TurnState
-from agentd.store.db import Database
+from agentd.store.db import SCHEMA_VERSION, Database
 from agentd.store.store import Store
 
 
@@ -33,13 +33,13 @@ def test_schema_creates_all_tables(store):
 
 def test_schema_version(store):
     version = store.db.connect().execute("PRAGMA user_version").fetchone()[0]
-    assert version == 1
+    assert version == SCHEMA_VERSION
 
 
 def test_reinitialize_is_idempotent(store):
     store.db.initialize()  # second call should not raise
     version = store.db.connect().execute("PRAGMA user_version").fetchone()[0]
-    assert version == 1
+    assert version == SCHEMA_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +392,6 @@ def test_end_turn_atomic(store):
     store.end_turn_atomic(
         turn["turn_id"],
         a["actor_id"],
-        msg["message_id"],
         outcome=TurnOutcome.SUCCEEDED,
         result="done",
     )
@@ -415,7 +414,6 @@ def test_end_turn_atomic_with_close(store):
     store.end_turn_atomic(
         turn["turn_id"],
         a["actor_id"],
-        msg["message_id"],
         outcome=TurnOutcome.CANCELED,
         close_actor=True,
     )
@@ -545,10 +543,103 @@ def test_end_turn_atomic_acks_claimed_message(store):
     store.end_turn_atomic(
         turn["turn_id"],
         a["actor_id"],
-        msg["message_id"],
         outcome=TurnOutcome.SUCCEEDED,
     )
 
     # After end, message is acked (not claimed, not queued)
     assert store.get_claimed_message(a["actor_id"]) is None
     assert store.count_queued(a["actor_id"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Env persistence
+# ---------------------------------------------------------------------------
+
+
+def test_actor_env_round_trip(store):
+    a = store.create_actor(name="t", scope_id=ROOT_SCOPE, backend="pi", env={"ACTOR_VAR": "a1"})
+    got = store.get_actor(a["actor_id"])
+    assert got["env"] == {"ACTOR_VAR": "a1"}
+
+    plain = store.create_actor(name="p", scope_id=ROOT_SCOPE, backend="pi")
+    assert store.get_actor(plain["actor_id"])["env"] == {}
+
+
+def test_message_env_cleared_on_ack(store):
+    a = store.create_actor(name="t", scope_id=ROOT_SCOPE, backend="pi")
+    msg = store.add_message(a["actor_id"], "message", {"text": "go"}, env={"OVERLAY": "v1"})
+    turn, claimed = store.open_turn_atomic(a["actor_id"])
+    assert claimed["env"] == {"OVERLAY": "v1"}
+
+    store.end_turn_atomic(turn["turn_id"], a["actor_id"], outcome=TurnOutcome.SUCCEEDED)
+
+    row = (
+        store.db.connect()
+        .execute("SELECT env, state FROM mailbox WHERE message_id = ?", (msg["message_id"],))
+        .fetchone()
+    )
+    assert row["state"] == "acked"
+    assert row["env"] is None
+
+
+def test_migration_v1_to_v2(tmp_path):
+    """A v1 database is upgraded in place: env columns added, event env scrubbed."""
+    import json
+
+    p = tmp_path / "old.db"
+    conn = sqlite3.connect(p)
+    conn.executescript(
+        """
+        CREATE TABLE actors(
+            actor_id TEXT PRIMARY KEY, name TEXT, scope_id TEXT NOT NULL,
+            parent_actor_id TEXT, backend TEXT NOT NULL,
+            backend_args TEXT NOT NULL DEFAULT '[]', cwd TEXT,
+            state TEXT NOT NULL DEFAULT 'idle', checkpoint TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE mailbox(
+            message_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL,
+            message_type TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}',
+            state TEXT NOT NULL DEFAULT 'queued', created_at TEXT NOT NULL,
+            acked_at TEXT
+        );
+        CREATE TABLE turns(
+            turn_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL,
+            state TEXT NOT NULL, outcome TEXT, result TEXT, error TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE events(
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, actor_id TEXT NOT NULL,
+            turn_id TEXT, event_type TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
+        );
+        CREATE TABLE triggers(
+            trigger_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL,
+            kind TEXT NOT NULL, spec TEXT NOT NULL DEFAULT '{}',
+            payload TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
+        );
+        PRAGMA user_version = 1;
+        """
+    )
+    leaked = json.dumps(
+        {"turn_id": "turn_x", "input": {"messages": [], "env": {"TOKEN": "tokval123"}}}
+    )
+    conn.execute(
+        "INSERT INTO events(actor_id, turn_id, event_type, payload, created_at)"
+        " VALUES ('act_x', 'turn_x', 'turn.opened', ?, '2026-01-01T00:00:00Z')",
+        (leaked,),
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(p)
+    db.initialize()
+    c = db.connect()
+    assert c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    actor_cols = {r[1] for r in c.execute("PRAGMA table_info(actors)")}
+    mailbox_cols = {r[1] for r in c.execute("PRAGMA table_info(mailbox)")}
+    assert "env" in actor_cols
+    assert "env" in mailbox_cols
+
+    payload = c.execute("SELECT payload FROM events WHERE turn_id = 'turn_x'").fetchone()[0]
+    assert "tokval123" not in payload

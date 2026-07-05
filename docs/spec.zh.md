@@ -524,8 +524,10 @@ inbox_gateway:
 
 分两层：
 
-- **Actor-level env**：`spawn.env` 设定，运行时内存持有（不持久化），作为该 actor 所有 turn 的默认执行环境。Daemon 重启后丢失
-- **Turn-level env overlay**：`emit.env` 设定，仅对由该 message 触发的 turn 生效，持久化在 `turn.opened` input snapshot 中，不回写 actor 默认 env
+- **Actor-level env**：`spawn.env` 设定，持久化在 `actors.env` 列，作为该 actor 所有 turn 的默认执行环境。Daemon 重启后仍在
+- **Turn-level env overlay**：`emit.env` 设定，仅对由该 message 触发的 turn 生效，持久化在 `mailbox.env` 列中、message 被 ack 时清空，不回写 actor 默认 env
+
+Env 值按静态密钥对待：`turn.opened` input snapshot 只记录 overlay 的 key 名（`env_keys`）而不记录值（events 表 append-only，写入即永久）。Overlay 值只在其 message 处于 queued/claimed 期间存在于 DB。数据库文件以 `0600` 权限创建。
 
 `deliver_as=steer` 时禁止携带 `env`（steer 不开启新 turn，无处应用 env overlay）。
 

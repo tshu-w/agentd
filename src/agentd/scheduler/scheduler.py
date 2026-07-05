@@ -56,16 +56,11 @@ class Scheduler:
         self.event_bus = event_bus
         self.config = config
         self._runtime: Runtime | None = None
-        # In-memory actor env (not persisted, lost on daemon restart)
-        self._actor_env: dict[str, dict[str, str]] = {}
-        # Track which message opened each turn (for acking on completion)
-        self._turn_message: dict[str, str] = {}  # turn_id -> message_id
-        # Env overlay for turns waiting dispatch (capacity-blocked)
-        self._pending_env: dict[str, dict[str, str] | None] = {}
-        # Turn-level env overlay (stored per message, applied when message opens a turn)
-        self._message_env: dict[str, dict[str, str]] = {}
         # Concurrency tracking (counts actually dispatched turns, not pending)
         self._running_count = 0
+        # Turns handed to the runtime but still PENDING in the store (the
+        # runtime flips them to RUNNING async); guards against re-dispatch.
+        self._dispatched_turns: set[str] = set()
 
     def set_runtime(self, runtime: Runtime) -> None:
         self._runtime = runtime
@@ -133,12 +128,9 @@ class Scheduler:
             cwd=cwd,
             state=initial_state,
             checkpoint=checkpoint_val,
+            env=env,
         )
         actor_id = actor["actor_id"]
-
-        # Store env in memory
-        if env:
-            self._actor_env[actor_id] = dict(env)
 
         # Emit actor.spawned event
         seq = self.store.append_event(
@@ -208,14 +200,8 @@ class Scheduler:
         # unrelated events is harmless: followers filter by actor.
         seq = self.store.get_max_seq()
 
-        # Store message in mailbox
-        msg = self.store.add_message(actor_id, msg_type, msg_payload)
-
-        # Store turn-level env overlay in message metadata
-        # (will be captured in turn.opened input snapshot)
-        if env:
-            # We track env overlay per message for when it opens a turn
-            self._message_env[msg["message_id"]] = dict(env)
+        # Store message in mailbox (env travels with the message, cleared on ack)
+        self.store.add_message(actor_id, msg_type, msg_payload, env=env)
 
         # Try to wake the actor
         woke = False
@@ -247,13 +233,12 @@ class Scheduler:
                     await self._runtime.stop_turn(turn["turn_id"])
                 else:
                     # Pending turn (or no runtime): end directly in store
+                    self._dispatched_turns.discard(turn["turn_id"])
                     self.store.end_turn_atomic(
                         turn["turn_id"],
                         actor_id,
-                        self._turn_message.pop(turn["turn_id"], None),
                         outcome=TurnOutcome.INTERRUPTED,
                     )
-                    self._pending_env.pop(turn["turn_id"], None)
                     seq = self.store.append_event(
                         actor_id,
                         EventType.TURN_END,
@@ -380,13 +365,12 @@ class Scheduler:
             return
 
         actor_id = turn["actor_id"]
-        message_id = self._turn_message.pop(turn_id, None)
+        self._dispatched_turns.discard(turn_id)
 
-        # End turn atomically
+        # End turn atomically (acks the claimed message)
         self.store.end_turn_atomic(
             turn_id,
             actor_id,
-            message_id,
             outcome=outcome,
             result=result,
             error=error,
@@ -526,9 +510,7 @@ class Scheduler:
                         child["actor_id"],
                     )
                     return
-                self.store.add_message(
-                    parent_actor_id, "env.turn_completed", payload
-                )
+                self.store.add_message(parent_actor_id, "env.turn_completed", payload)
         except SchedulerError as exc:
             if exc.error_type == "actor_closed":
                 # Expected race: parent closed between turn.end and notify.
@@ -569,20 +551,16 @@ class Scheduler:
 
         turn, msg = result
         turn_id = turn["turn_id"]
-        message_id = msg["message_id"]
 
-        # Track message for acking on completion
-        self._turn_message[turn_id] = message_id
-
-        # Build input snapshot (the claimed message is the turn input)
+        # The claimed message is the turn input; its env is the turn overlay
         input_messages = [msg]
+        env_overlay = msg.get("env")
 
-        # Get env overlay if any
-        env_overlay = self._message_env.pop(message_id, None)
-
+        # Snapshot for the append-only event log: env values are secrets
+        # (bot tokens etc.) and must not be persisted forever — keep keys only.
         input_snapshot = {
-            "messages": input_messages,
-            "env": env_overlay,
+            "messages": [{k: v for k, v in m.items() if k != "env"} for m in input_messages],
+            "env_keys": sorted(env_overlay) if env_overlay else [],
         }
 
         # Emit turn.opened event
@@ -607,7 +585,6 @@ class Scheduler:
         if self._running_count < self.config.limits.max_total_workers:
             self._dispatch_to_runtime(turn_id, actor_id, input_messages, env_overlay)
         else:
-            self._pending_env[turn_id] = env_overlay
             logger.info("capacity full, turn %s pending for actor %s", turn_id, actor_id)
 
         return {
@@ -625,6 +602,7 @@ class Scheduler:
         """Send a pending turn to the runtime for execution."""
         if not self._runtime:
             return
+        self._dispatched_turns.add(turn_id)
         actor = self.store.get_actor(actor_id)
         if actor is None:
             # Actors are never physically deleted (only marked CLOSED), so this
@@ -639,8 +617,7 @@ class Scheduler:
                 )
             )
             return
-        actor_env = self._actor_env.get(actor_id, {})
-        merged_env = {**actor_env, **(env_overlay or {})}
+        merged_env = {**(actor.get("env") or {}), **(env_overlay or {})}
         self._runtime.prepare_turn(turn_id)
         asyncio.create_task(
             self._runtime.execute_turn(
@@ -669,26 +646,24 @@ class Scheduler:
                     # Force end if runtime didn't complete it
                     turn = self.store.get_turn(turn["turn_id"])
                     if turn and turn["state"] != TurnState.ENDED.value:
+                        self._dispatched_turns.discard(turn["turn_id"])
                         self.store.end_turn_atomic(
                             turn["turn_id"],
                             aid,
-                            self._turn_message.pop(turn["turn_id"], None),
                             outcome=TurnOutcome.CANCELED,
                         )
                         if was_running:
                             self._running_count = max(0, self._running_count - 1)
-                    self._pending_env.pop(turn["turn_id"], None) if turn else None
                 elif turn:
                     was_running = turn["state"] == TurnState.RUNNING.value
+                    self._dispatched_turns.discard(turn["turn_id"])
                     self.store.end_turn_atomic(
                         turn["turn_id"],
                         aid,
-                        self._turn_message.pop(turn["turn_id"], None),
                         outcome=TurnOutcome.CANCELED,
                     )
                     if was_running:
                         self._running_count = max(0, self._running_count - 1)
-                    self._pending_env.pop(turn["turn_id"], None)
             # Close actor
             if a["state"] != ActorState.CLOSED.value:
                 self.store.transition_actor(aid, ActorState.CLOSED)
@@ -710,8 +685,6 @@ class Scheduler:
                     seq,
                 )
                 changed += 1
-            # Clean up env
-            self._actor_env.pop(aid, None)
         return changed
 
     def _wait_result(self, actor_id: str) -> dict[str, Any]:
@@ -724,15 +697,6 @@ class Scheduler:
             "error_code": _public_error_code(last_turn),
             "turn_id": last_turn.get("turn_id") if last_turn else None,
         }
-
-    def _recover_env_overlay(self, turn_id: str) -> dict[str, str] | None:
-        """Recover env overlay from persisted turn.opened event (for reconcile)."""
-        events = self.store.list_events_by_turn(turn_id, limit=1)
-        for ev in events:
-            if ev["event_type"] == EventType.TURN_OPENED:
-                inp = ev.get("payload", {}).get("input", {})
-                return inp.get("env")
-        return None
 
     def _publish_event(
         self,
@@ -772,15 +736,12 @@ class Scheduler:
                 except OSError:
                     pass
 
-        # 2. Fail running turns (recover claimed message for acking)
+        # 2. Fail running turns (end_turn_atomic acks the claimed message)
         for turn in self.store.list_running_turns():
             actor_id = turn["actor_id"]
-            claimed = self.store.get_claimed_message(actor_id)
-            message_id = claimed["message_id"] if claimed else None
             self.store.end_turn_atomic(
                 turn["turn_id"],
                 actor_id,
-                message_id,
                 outcome=TurnOutcome.FAILED,
                 error="daemon restarted",
             )
@@ -803,24 +764,19 @@ class Scheduler:
                     wake=False,
                 )
 
-        # 3. Reschedule pending turns (recover claimed message, track for acking)
+        # 3. Reschedule pending turns (env comes back with the claimed message;
+        #    capacity-blocked turns stay pending and are found again by
+        #    _try_schedule_waiting via list_pending_turns)
         for turn in self.store.list_pending_turns():
             actor_id = turn["actor_id"]
             actor = self.store.get_actor(actor_id)
             if actor and actor["state"] == ActorState.ACTIVE.value:
+                if self._running_count >= self.config.limits.max_total_workers:
+                    continue
                 claimed = self.store.get_claimed_message(actor_id)
-                if claimed:
-                    self._turn_message[turn["turn_id"]] = claimed["message_id"]
                 input_messages = [claimed] if claimed else []
-                # Recover env overlay from turn.opened event
-                env_overlay = self._recover_env_overlay(turn["turn_id"])
-                # Dispatch if capacity available; otherwise track for later
-                if self._running_count < self.config.limits.max_total_workers:
-                    self._dispatch_to_runtime(
-                        turn["turn_id"], actor_id, input_messages, env_overlay
-                    )
-                else:
-                    self._pending_env[turn["turn_id"]] = env_overlay
+                env_overlay = claimed.get("env") if claimed else None
+                self._dispatch_to_runtime(turn["turn_id"], actor_id, input_messages, env_overlay)
 
         # 4. Wakeup idle actors with queued messages
         for actor in self.store.list_idle_actors_with_queued():
@@ -835,19 +791,17 @@ class Scheduler:
         if self._running_count >= self.config.limits.max_total_workers:
             return
 
-        # 1. Dispatch capacity-blocked pending turns (tracked in _pending_env)
-        for turn_id in list(self._pending_env.keys()):
+        # 1. Dispatch capacity-blocked pending turns
+        for turn in self.store.list_pending_turns():
             if self._running_count >= self.config.limits.max_total_workers:
                 return
-            turn = self.store.get_turn(turn_id)
-            if turn is None or turn["state"] != TurnState.PENDING.value:
-                self._pending_env.pop(turn_id, None)
+            if turn["turn_id"] in self._dispatched_turns:
                 continue
             actor_id = turn["actor_id"]
             claimed = self.store.get_claimed_message(actor_id)
             input_messages = [claimed] if claimed else []
-            env_overlay = self._pending_env.pop(turn_id, None)
-            self._dispatch_to_runtime(turn_id, actor_id, input_messages, env_overlay)
+            env_overlay = claimed.get("env") if claimed else None
+            self._dispatch_to_runtime(turn["turn_id"], actor_id, input_messages, env_overlay)
 
         # 2. Open new turns for idle actors with queued messages
         for actor in self.store.list_idle_actors_with_queued():

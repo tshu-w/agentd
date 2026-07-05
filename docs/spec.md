@@ -524,8 +524,10 @@ Each backend subprocess receives automatically:
 
 Two layers:
 
-- **Actor-level env**: set via `spawn.env`, held in memory at runtime (not persisted); serves as the default execution environment for all turns of that actor. Lost on daemon restart.
-- **Turn-level env overlay**: set via `emit.env`, applies only to the turn triggered by that message; persisted in the `turn.opened` input snapshot; does not write back to actor default env.
+- **Actor-level env**: set via `spawn.env`, persisted in the `actors.env` column; serves as the default execution environment for all turns of that actor. Survives daemon restart.
+- **Turn-level env overlay**: set via `emit.env`, applies only to the turn triggered by that message; persisted in the `mailbox.env` column and cleared when the message is acked; does not write back to actor default env.
+
+Env values are treated as secrets at rest: the `turn.opened` input snapshot records only the overlay's key names (`env_keys`), never values, since the events table is append-only. Overlay values live in the DB only while their message is queued/claimed. The database file is created with `0600` permissions.
 
 `deliver_as=steer` prohibits carrying `env` (steer does not open a new turn; there is no place to apply env overlay).
 

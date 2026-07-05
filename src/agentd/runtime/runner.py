@@ -626,11 +626,7 @@ class Runtime:
             base = gw.public_base_url or f"http://{gw.host}:{gw.port}"
             env["AGENTD_INBOX_URL"] = f"{base}/v1/actors/{actor['actor_id']}/inbox"
 
-        # Actor-level env (from scheduler's in-memory store)
-        actor_env = self.scheduler._actor_env.get(actor["actor_id"], {})
-        env.update(actor_env)
-
-        # Turn-level env overlay
+        # Actor env + turn overlay, already merged by the scheduler
         if extra_env:
             env.update(extra_env)
 

@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# version -> statements upgrading from version-1
+MIGRATIONS: dict[int, list[str]] = {
+    2: [
+        "ALTER TABLE actors ADD COLUMN env TEXT NOT NULL DEFAULT '{}'",
+        "ALTER TABLE mailbox ADD COLUMN env TEXT",
+        # v1 persisted env overlay values inside turn.opened input snapshots;
+        # scrub them — secrets don't belong in the append-only event log.
+        "UPDATE events SET payload = json_remove(payload, '$.input.env')"
+        " WHERE event_type = 'turn.opened'"
+        " AND json_extract(payload, '$.input.env') IS NOT NULL",
+    ],
+}
 
 
 def utc_now() -> str:
@@ -31,6 +45,9 @@ class Database:
             check_same_thread=False,
         )
         conn.row_factory = sqlite3.Row
+        # Restrict before WAL mode: SQLite copies the main db file's
+        # permissions when creating -wal/-shm.
+        self._restrict_permissions()
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -71,6 +88,9 @@ class Database:
         if required.issubset(tables):
             if version == SCHEMA_VERSION:
                 return
+            if version < SCHEMA_VERSION:
+                self._migrate(conn, version)
+                return
             raise RuntimeError(f"unsupported schema version: {version} (expected {SCHEMA_VERSION})")
         # Stale/incompatible DB: has some tables but not the right set
         if tables - {"sqlite_sequence"} and not required.issubset(tables):
@@ -82,6 +102,23 @@ class Database:
         conn.executescript(
             f"BEGIN IMMEDIATE;\n{schema_sql}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
         )
+
+    def _migrate(self, conn: sqlite3.Connection, from_version: int) -> None:
+        for version in range(from_version + 1, SCHEMA_VERSION + 1):
+            statements = MIGRATIONS.get(version)
+            if statements is None:
+                raise RuntimeError(f"no migration path to schema version {version}")
+            script = ";\n".join(statements)
+            conn.executescript(
+                f"BEGIN IMMEDIATE;\n{script};\nPRAGMA user_version = {version};\nCOMMIT;\n"
+            )
+
+    def _restrict_permissions(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(f"{self.path}{suffix}")
+            if p.exists():
+                with suppress(OSError):
+                    os.chmod(p, 0o600)
 
     def __del__(self) -> None:
         with suppress(Exception):

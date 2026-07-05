@@ -68,6 +68,7 @@ class Store:
         d = dict(row)
         d["backend_args"] = self._parse_json(d.pop("backend_args", "[]"), [])
         d["checkpoint"] = self._parse_json(d.get("checkpoint"), None)
+        d["env"] = self._parse_json(d.get("env", "{}"), {})
         return d
 
     @overload
@@ -92,6 +93,7 @@ class Store:
             return None
         d = dict(row)
         d["payload"] = self._parse_json(d.get("payload", "{}"), {})
+        d["env"] = self._parse_json(d["env"], None) if d.get("env") else None
         return d
 
     @overload
@@ -136,6 +138,7 @@ class Store:
         cwd: str | None = None,
         state: ActorState = ActorState.IDLE,
         checkpoint: dict | None = None,
+        env: dict[str, str] | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> dict[str, Any]:
         actor_id = gen_id("act")
@@ -144,9 +147,9 @@ class Store:
         c.execute(
             """INSERT INTO actors(
                 actor_id, name, scope_id, parent_actor_id,
-                backend, backend_args, cwd, state, checkpoint,
+                backend, backend_args, cwd, state, checkpoint, env,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 actor_id,
                 name,
@@ -157,6 +160,7 @@ class Store:
                 cwd,
                 state.value,
                 json.dumps(checkpoint) if checkpoint is not None else None,
+                json.dumps(env or {}),
                 now,
                 now,
             ),
@@ -171,6 +175,7 @@ class Store:
             "cwd": cwd,
             "state": state.value,
             "checkpoint": checkpoint,
+            "env": env or {},
             "created_at": now,
             "updated_at": now,
             "closed_at": None,
@@ -407,21 +412,31 @@ class Store:
         message_type: str,
         payload: dict[str, Any],
         *,
+        env: dict[str, str] | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> dict[str, Any]:
         message_id = gen_id("msg")
         now = utc_now()
         c = conn or self.db.connect()
         c.execute(
-            """INSERT INTO mailbox(message_id, actor_id, message_type, payload, state, created_at)
-               VALUES (?, ?, ?, ?, 'queued', ?)""",
-            (message_id, actor_id, message_type, json.dumps(payload), now),
+            """INSERT INTO mailbox(message_id, actor_id, message_type, payload, env,
+                                   state, created_at)
+               VALUES (?, ?, ?, ?, ?, 'queued', ?)""",
+            (
+                message_id,
+                actor_id,
+                message_type,
+                json.dumps(payload),
+                json.dumps(env) if env else None,
+                now,
+            ),
         )
         return {
             "message_id": message_id,
             "actor_id": actor_id,
             "message_type": message_type,
             "payload": payload,
+            "env": env,
             "state": "queued",
             "created_at": now,
             "acked_at": None,
@@ -478,10 +493,15 @@ class Store:
         *,
         conn: sqlite3.Connection | None = None,
     ) -> None:
-        """Ack a message (claimed → acked, or queued → acked)."""
+        """Ack a message (claimed → acked, or queued → acked).
+
+        Clears env so secrets only rest in the DB while a message is
+        queued/claimed — acked history keeps type and payload only.
+        """
         c = conn or self.db.connect()
         c.execute(
-            "UPDATE mailbox SET state = 'acked', acked_at = ? WHERE message_id = ? AND state != 'acked'",
+            "UPDATE mailbox SET state = 'acked', acked_at = ?, env = NULL"
+            " WHERE message_id = ? AND state != 'acked'",
             (utc_now(), message_id),
         )
 
@@ -691,14 +711,17 @@ class Store:
         self,
         turn_id: str,
         actor_id: str,
-        message_id: str | None,
         *,
         outcome: TurnOutcome,
         result: str | None = None,
         error: str | None = None,
         close_actor: bool = False,
     ) -> None:
-        """Atomically: end turn, ack message, actor → idle (or closed)."""
+        """Atomically: end turn, ack the claimed message, actor → idle (or closed).
+
+        The message to ack is resolved inside the transaction: one active
+        turn per actor implies at most one claimed message per actor.
+        """
         with self.db.transaction() as conn:
             self.transition_turn(
                 turn_id,
@@ -708,8 +731,9 @@ class Store:
                 error=error,
                 conn=conn,
             )
-            if message_id:
-                self.ack_message(message_id, conn=conn)
+            claimed = self.get_claimed_message(actor_id, conn=conn)
+            if claimed:
+                self.ack_message(claimed["message_id"], conn=conn)
             target = ActorState.CLOSED if close_actor else ActorState.IDLE
             self.transition_actor(actor_id, target, conn=conn)
 

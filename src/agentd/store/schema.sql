@@ -1,4 +1,4 @@
--- agentd v1 schema
+-- agentd schema (see SCHEMA_VERSION in db.py; changes need a migration there)
 
 CREATE TABLE actors (
     actor_id        TEXT PRIMARY KEY,
@@ -10,6 +10,7 @@ CREATE TABLE actors (
     cwd             TEXT,
     state           TEXT NOT NULL DEFAULT 'idle',
     checkpoint      TEXT,
+    env             TEXT NOT NULL DEFAULT '{}',
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
     closed_at       TEXT
@@ -33,6 +34,7 @@ CREATE TABLE mailbox (
     actor_id     TEXT NOT NULL,
     message_type TEXT NOT NULL,
     payload      TEXT NOT NULL DEFAULT '{}',
+    env          TEXT,
     state        TEXT NOT NULL DEFAULT 'queued',
     created_at   TEXT NOT NULL,
     acked_at     TEXT

@@ -63,7 +63,6 @@ async def test_capacity_release_preserves_pending_turn_without_runtime(env):
     store.add_message(a["actor_id"], "message", {"text": "a"})
     turn_a, msg_a = store.open_turn_atomic(a["actor_id"])
     store.transition_turn(turn_a["turn_id"], TurnState.RUNNING)
-    sch._turn_message[turn_a["turn_id"]] = msg_a["message_id"]
     sch._running_count = 2  # both slots full
 
     # Actor B gets a pending turn (capacity full)
@@ -97,7 +96,6 @@ async def test_same_actor_wakeup_chain(env):
     await sch.emit(actor_id=a["actor_id"], msg_type="message", msg_payload={"text": "m1"})
     turn1 = store.get_active_turn(a["actor_id"])
     assert turn1 is not None
-    sch._turn_message[turn1["turn_id"]] = store.get_claimed_message(a["actor_id"])["message_id"]
 
     # Second message → queued (actor already active)
     await sch.emit(actor_id=a["actor_id"], msg_type="message", msg_payload={"text": "m2"})
@@ -209,7 +207,6 @@ async def test_no_double_dispatch_on_turn_complete(env):
     store.add_message(a["actor_id"], "message", {"text": "m1"})
     t1, msg1 = store.open_turn_atomic(a["actor_id"])
     store.transition_turn(t1["turn_id"], TurnState.RUNNING)
-    sch._turn_message[t1["turn_id"]] = msg1["message_id"]
     sch._running_count = 1
 
     # m2 queued while a is active
@@ -287,7 +284,6 @@ async def test_no_duplicate_turn_end_event(env):
     a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
     store.add_message(a["actor_id"], "message", {"text": "hi"})
     turn, msg = store.open_turn_atomic(a["actor_id"])
-    sch._turn_message[turn["turn_id"]] = msg["message_id"]
     store.transition_turn(turn["turn_id"], TurnState.RUNNING)
 
     # Simulate backend raw turn_end → _handle_parsed
@@ -731,3 +727,80 @@ async def test_emit_event_seq_anchors_before_own_events(env):
 
     events = store.list_events(a["actor_id"], since_seq=res["event_seq"])
     assert any(e["event_type"] == "turn.opened" for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Env persistence (actor env + message overlay live in the store)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_env_survives_daemon_restart(env):
+    """Actor env and queued message env must survive a scheduler restart."""
+    store, bus, sch = env
+
+    r = await sch.spawn(name="worker", backend="pi", env={"SECRET": "s3cr3t"})
+    actor_id = r["actor_id"]
+    await sch.emit(
+        actor_id=actor_id,
+        msg_type="message",
+        msg_payload={"text": "go"},
+        env={"OVERLAY": "v1"},
+    )
+
+    # Fresh scheduler over the same store = daemon restart
+    cfg = AgentDConfig()
+    cfg.limits.max_total_workers = 2
+    sch2 = Scheduler(store, bus, cfg)
+    rt = _FakeRuntime()
+    sch2.set_runtime(rt)  # ty: ignore[invalid-argument-type]
+    await sch2.reconcile()
+    await asyncio.sleep(0)
+
+    assert len(rt.calls) == 1
+    dispatched_env = rt.calls[0]["env"]
+    assert dispatched_env["SECRET"] == "s3cr3t"
+    assert dispatched_env["OVERLAY"] == "v1"
+
+
+@pytest.mark.asyncio
+async def test_turn_opened_snapshot_has_env_keys_not_values(env):
+    """turn.opened input snapshots must never persist env values."""
+    store, _bus, sch = env
+    rt = _FakeRuntime()
+    sch.set_runtime(rt)
+
+    r = await sch.spawn(
+        name="worker",
+        backend="pi",
+        msg_type="message",
+        msg_payload={"text": "go"},
+        env={"TOKEN": "supersecret"},
+    )
+    actor_id = r["actor_id"]
+    await asyncio.sleep(0)
+
+    # Emit with a turn-level env overlay while the first turn is active,
+    # then finish the first turn so the overlay message opens its own turn.
+    await sch.emit(
+        actor_id=actor_id,
+        msg_type="message",
+        msg_payload={"text": "more"},
+        env={"OVERLAY_TOKEN": "ovval456"},
+    )
+    first_turn = store.get_active_turn(actor_id)
+    await sch.on_turn_completed(first_turn["turn_id"], outcome=TurnOutcome.SUCCEEDED)
+    await asyncio.sleep(0)
+
+    events = store.list_events(actor_id, limit=50)
+    opened = [e for e in events if e["event_type"] == EventType.TURN_OPENED]
+    assert len(opened) == 2
+    # Spawn env is actor-level: not part of the turn input at all
+    assert opened[0]["payload"]["input"]["env_keys"] == []
+    # Emit env overlay: keys recorded, values never
+    assert opened[1]["payload"]["input"]["env_keys"] == ["OVERLAY_TOKEN"]
+    import json as _json
+
+    raw = _json.dumps(opened)
+    assert "supersecret" not in raw
+    assert "ovval456" not in raw
