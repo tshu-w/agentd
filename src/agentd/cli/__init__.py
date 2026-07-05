@@ -81,10 +81,13 @@ def main() -> None:
     # -- trigger --
     tr = sub.add_parser("trigger", help="Manage triggers")
     tr_sub = tr.add_subparsers(dest="trigger_cmd")
-    tr_add = tr_sub.add_parser("add", help="Add a cron trigger")
+    tr_add = tr_sub.add_parser("add", help="Add a timed trigger (cron / one-shot / interval)")
     tr_add.add_argument("actor", help="Actor reference (id or name)")
-    tr_add.add_argument("--schedule", required=True, help="Cron expression (5-field)")
-    tr_add.add_argument("--type", "-t", dest="msg_type", required=True)
+    tr_add.add_argument("--schedule", help="Recurring: cron expression (5-field, local time)")
+    tr_add.add_argument("--at", help="One-shot: ISO 8601 time (local tz if no offset)")
+    tr_add.add_argument("--in", dest="in_", help="One-shot: delay like 90s, 15m, 3h, 1d, 1h30m")
+    tr_add.add_argument("--every", help="Recurring: fixed interval like 15m, 3h")
+    tr_add.add_argument("--type", "-t", dest="msg_type", default="message")
     tr_add.add_argument("--payload", default="{}")
     tr_ls = tr_sub.add_parser("ls", help="List triggers")
     tr_ls.add_argument("actor", nargs="?", help="Actor reference (optional filter)")
@@ -443,6 +446,9 @@ async def _cmd_trigger(args: argparse.Namespace, client: RpcClient) -> None:
             {
                 "actor": args.actor,
                 "schedule": args.schedule,
+                "at": args.at,
+                "in": args.in_,
+                "every": args.every,
                 "type": args.msg_type,
                 "payload": json.loads(args.payload),
             },

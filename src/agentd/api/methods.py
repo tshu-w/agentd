@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from agentd.config import AgentDConfig
@@ -29,7 +30,13 @@ from agentd.protocol import (
     make_stream_end,
     make_stream_event,
 )
-from agentd.scheduler.cron import compute_next_fire
+from agentd.scheduler.cron import (
+    CRON_CHECK_INTERVAL,
+    compute_next_fire,
+    parse_at,
+    parse_duration,
+    to_utc_iso,
+)
 from agentd.scheduler.event_bus import EventBus, SlowConsumerError
 from agentd.scheduler.scheduler import Scheduler, SchedulerError
 from agentd.store import Store
@@ -623,16 +630,61 @@ class MethodDispatcher:
             )
             return
 
-        # Validate cron expression
+        modes = [
+            name
+            for name, value in (
+                ("schedule", p.schedule),
+                ("at", p.at),
+                ("in", p.in_),
+                ("every", p.every),
+            )
+            if value
+        ]
+        if len(modes) != 1:
+            await _write(
+                writer,
+                make_error(
+                    req_id,
+                    INVALID_PARAMS,
+                    "exactly one of schedule/at/in/every is required",
+                    ErrorType.INVALID_PARAMS,
+                ),
+            )
+            return
+
         try:
-            next_fire = compute_next_fire(p.schedule)
+            kind: str
+            spec: dict[str, Any]
+            if p.schedule:
+                kind = "cron"
+                spec = {"cron": p.schedule}
+                next_fire = compute_next_fire(p.schedule)
+            elif p.at:
+                at_dt = parse_at(p.at)
+                if at_dt <= datetime.now(UTC):
+                    raise ValueError(f"time is in the past: {p.at}")
+                kind = "at"
+                next_fire = to_utc_iso(at_dt)
+                spec = {"at": next_fire}
+            elif p.in_:
+                delay = parse_duration(p.in_)
+                kind = "at"
+                next_fire = to_utc_iso(datetime.now(UTC) + timedelta(seconds=delay))
+                spec = {"at": next_fire}
+            else:
+                interval = parse_duration(p.every or "")
+                if interval < CRON_CHECK_INTERVAL:
+                    raise ValueError(f"interval must be >= {CRON_CHECK_INTERVAL}s")
+                kind = "every"
+                spec = {"every_seconds": interval}
+                next_fire = to_utc_iso(datetime.now(UTC) + timedelta(seconds=interval))
         except Exception as e:
             await _write(
                 writer,
                 make_error(
                     req_id,
                     INVALID_PARAMS,
-                    f"invalid cron: {e}",
+                    f"invalid trigger schedule: {e}",
                     ErrorType.INVALID_PARAMS,
                 ),
             )
@@ -640,8 +692,8 @@ class MethodDispatcher:
 
         trigger = self.store.add_trigger(
             target_actor_id=actor["actor_id"],
-            kind="cron",
-            spec={"cron": p.schedule},
+            kind=kind,
+            spec=spec,
             message_type=p.type,
             payload=p.payload,
             next_fire_at=next_fire,

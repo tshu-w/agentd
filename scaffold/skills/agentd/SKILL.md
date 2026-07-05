@@ -87,6 +87,28 @@ while ! echo "$feedback" | grep -qi "LGTM"; do
 done
 ```
 
+### Timed wakeups (set yourself an alarm)
+
+You can schedule a message to your own mailbox instead of blocking or polling.
+Write the payload text as an instruction to your future self — it arrives as a
+normal message with no other context.
+
+```bash
+# One-shot: wake up in 3 hours (also --at "2026-07-06T09:00", local tz if no offset)
+agentd trigger add "$AGENTD_ACTOR_ID" --in 3h \
+  --payload '{"text": "Check whether CI for pi-tape finished; report the outcome to the user."}'
+
+# Recurring: cron (local time) or fixed interval
+agentd trigger add "$AGENTD_ACTOR_ID" --schedule "0 9 * * *" \
+  --payload '{"text": "Morning briefing: summarize overnight notifications."}'
+agentd trigger add "$AGENTD_ACTOR_ID" --every 30m \
+  --payload '{"text": "Poll the release checklist; stop this trigger (trigger rm) once everything is green."}'
+```
+
+One-shot triggers delete themselves after firing; recurring ones persist until
+`agentd trigger rm <trigger_id>` (list with `agentd trigger ls`). Use an alarm
+for "keep an eye on X until Y" tasks: end your turn instead of waiting.
+
 ## Output format
 
 Non-TTY (agent calling agentd): JSON envelope per line.

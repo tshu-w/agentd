@@ -405,8 +405,11 @@ class TriggerAddParams(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     actor: str
-    schedule: str
-    type: str = Field(alias="type")
+    schedule: str | None = None
+    at: str | None = None
+    in_: str | None = Field(default=None, alias="in")
+    every: str | None = None
+    type: str = "message"
     payload: dict[str, Any] = Field(default_factory=dict)
 
 

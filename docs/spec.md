@@ -415,11 +415,11 @@ Response:
 
 ### 5.4 Trigger Methods
 
-- `trigger.add`: parameters `actor`, `schedule`, `type`, `payload`
+- `trigger.add`: parameters `actor`, exactly one of `schedule` (cron) / `at` (one-shot, ISO 8601) / `in` (one-shot, relative delay) / `every` (fixed interval), `type` (default `message`), `payload`
 - `trigger.ls`: optionally filter by actor
 - `trigger.rm`: delete by trigger_id
 
-Cron format: standard 5-field (minute hour day month weekday), no seconds or year fields. Timezone semantics: schedule is interpreted in daemon process local timezone (consistent with system cron behavior); internally stored `next_fire_at` is UTC.
+Cron format: standard 5-field (minute hour day month weekday), no seconds or year fields. Timezone semantics: schedule is interpreted in daemon process local timezone (consistent with system cron behavior); internally stored `next_fire_at` is UTC. `at` accepts ISO 8601 (local timezone if no offset) and must be in the future. `in`/`every` accept durations like `90s`, `15m`, `3h`, `1d`, `1h30m`; `every` must be >= the trigger check interval (10s). One-shot triggers delete themselves after firing; recurring triggers persist until `trigger.rm`.
 
 ### 5.5 HTTP Inbox Bridge
 
@@ -712,8 +712,8 @@ Append-only log. `seq` is globally monotonically increasing, providing cross-act
 |---|---|
 | `trigger_id` | Primary key |
 | `target_actor_id` | FK |
-| `kind` | v1: `cron` |
-| `spec` | JSON; trigger specification (e.g., cron expression) |
+| `kind` | `cron` (recurring, cron expression), `every` (recurring, fixed interval), `at` (one-shot; deleted after firing) |
+| `spec` | JSON; trigger specification (e.g., `{"cron": ...}`, `{"every_seconds": ...}`, `{"at": ...}`) |
 | `message_type`, `payload` | Message generated when fired |
 | `next_fire_at` | |
 | `created_at` | |
