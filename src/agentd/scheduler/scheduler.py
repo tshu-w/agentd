@@ -22,8 +22,6 @@ from agentd.protocol import (
 )
 from agentd.store import Store
 
-from .event_bus import EventBus
-
 if TYPE_CHECKING:
     from agentd.runtime.runner import Runtime
 
@@ -51,9 +49,8 @@ def _public_error_code(turn: dict[str, Any] | None) -> str | None:
 
 
 class Scheduler:
-    def __init__(self, store: Store, event_bus: EventBus, config: AgentDConfig):
+    def __init__(self, store: Store, config: AgentDConfig):
         self.store = store
-        self.event_bus = event_bus
         self.config = config
         self._runtime: Runtime | None = None
 
@@ -124,17 +121,6 @@ class Scheduler:
             actor_id,
             EventType.ACTOR_SPAWNED,
             {"actor_id": actor_id, "name": name, "backend": backend},
-        )
-        self._publish_event(
-            actor_id,
-            None,
-            EventType.ACTOR_SPAWNED,
-            {
-                "actor_id": actor_id,
-                "name": name,
-                "backend": backend,
-            },
-            seq,
         )
 
         # If initial input provided, add to mailbox and schedule
@@ -225,7 +211,7 @@ class Scheduler:
                         actor_id,
                         outcome=TurnOutcome.INTERRUPTED,
                     )
-                    seq = self.store.append_event(
+                    self.store.append_event(
                         actor_id,
                         EventType.TURN_END,
                         {
@@ -235,18 +221,6 @@ class Scheduler:
                             "error": None,
                         },
                         turn_id=turn["turn_id"],
-                    )
-                    self._publish_event(
-                        actor_id,
-                        turn["turn_id"],
-                        EventType.TURN_END,
-                        {
-                            "turn_id": turn["turn_id"],
-                            "outcome": TurnOutcome.INTERRUPTED.value,
-                            "result": None,
-                            "error": None,
-                        },
-                        seq,
                     )
                 changed = 1
 
@@ -320,21 +294,11 @@ class Scheduler:
             return
         actor_id = turn["actor_id"]
         self.store.transition_turn(turn_id, TurnState.RUNNING, exec_pid=pid)
-        seq = self.store.append_event(
+        self.store.append_event(
             actor_id,
             EventType.TURN_STARTED,
             {"turn_id": turn_id, "exec_pid": pid},
             turn_id=turn_id,
-        )
-        self._publish_event(
-            actor_id,
-            turn_id,
-            EventType.TURN_STARTED,
-            {
-                "turn_id": turn_id,
-                "exec_pid": pid,
-            },
-            seq,
         )
 
     async def on_turn_completed(
@@ -362,23 +326,11 @@ class Scheduler:
         )
 
         # Emit turn.end event
-        seq = self.store.append_event(
+        self.store.append_event(
             actor_id,
             EventType.TURN_END,
             {"turn_id": turn_id, "outcome": outcome.value, "result": result, "error": error},
             turn_id=turn_id,
-        )
-        self._publish_event(
-            actor_id,
-            turn_id,
-            EventType.TURN_END,
-            {
-                "turn_id": turn_id,
-                "outcome": outcome.value,
-                "result": result,
-                "error": error,
-            },
-            seq,
         )
 
         # Notify parent BEFORE the child's own wakeup chain so the bus event
@@ -415,15 +367,16 @@ class Scheduler:
         event_type: str,
         payload: dict[str, Any],
     ) -> int:
-        """Append event to store and publish to bus. Returns seq."""
-        seq = self.store.append_event(
+        """Append event to the store (the single event channel; followers poll it).
+
+        Returns seq.
+        """
+        return self.store.append_event(
             actor_id,
             event_type,
             payload,
             turn_id=turn_id,
         )
-        self._publish_event(actor_id, turn_id, event_type, payload, seq)
-        return seq
 
     async def _notify_parent_turn_completed(
         self,
@@ -542,21 +495,11 @@ class Scheduler:
         }
 
         # Emit turn.opened event
-        seq = self.store.append_event(
+        self.store.append_event(
             actor_id,
             EventType.TURN_OPENED,
             {"turn_id": turn_id, "input": input_snapshot},
             turn_id=turn_id,
-        )
-        self._publish_event(
-            actor_id,
-            turn_id,
-            EventType.TURN_OPENED,
-            {
-                "turn_id": turn_id,
-                "input": input_snapshot,
-            },
-            seq,
         )
 
         # Dispatch to runtime
@@ -635,19 +578,10 @@ class Scheduler:
                 # Delete triggers
                 self.store.delete_triggers_for_actor(aid)
                 # Emit event
-                seq = self.store.append_event(
+                self.store.append_event(
                     aid,
                     EventType.ACTOR_CLOSED,
                     {"reason": "closed"},
-                )
-                self._publish_event(
-                    aid,
-                    None,
-                    EventType.ACTOR_CLOSED,
-                    {
-                        "reason": "closed",
-                    },
-                    seq,
                 )
                 changed += 1
         return changed
@@ -662,24 +596,6 @@ class Scheduler:
             "error_code": _public_error_code(last_turn),
             "turn_id": last_turn.get("turn_id") if last_turn else None,
         }
-
-    def _publish_event(
-        self,
-        actor_id: str,
-        turn_id: str | None,
-        event_type: str,
-        payload: dict[str, Any],
-        seq: int,
-    ) -> None:
-        self.event_bus.publish(
-            {
-                "seq": seq,
-                "actor_id": actor_id,
-                "turn_id": turn_id,
-                "event_type": event_type,
-                "payload": payload,
-            }
-        )
 
     # ------------------------------------------------------------------
     # Startup reconciliation

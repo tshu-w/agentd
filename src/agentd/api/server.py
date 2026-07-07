@@ -1,6 +1,6 @@
 """agentd daemon — Unix socket JSON-RPC 2.0 server.
 
-Wires together Store, EventBus, Scheduler, Runtime, and serves
+Wires together Store, Scheduler, Runtime, and serves
 RPC requests over a Unix domain socket.
 """
 
@@ -25,7 +25,6 @@ from agentd.protocol import (
 from agentd.runtime.backends import ClaudeAdapter, CodexAdapter, PiAdapter
 from agentd.runtime.runner import Runtime
 from agentd.scheduler.cron import run_cron_loop
-from agentd.scheduler.event_bus import EventBus
 from agentd.scheduler.scheduler import Scheduler
 from agentd.store import Store
 from agentd.store.db import Database
@@ -50,9 +49,8 @@ class Daemon:
         config.resolve_workspace()  # Ensure workspace dir exists
         db = Database(config.db_path)
         self.store = Store(db)
-        self.event_bus = EventBus()
-        self.scheduler = Scheduler(self.store, self.event_bus, config)
-        self.runtime = Runtime(self.store, self.event_bus, config, self.scheduler)
+        self.scheduler = Scheduler(self.store, config)
+        self.runtime = Runtime(self.store, config, self.scheduler)
         self.scheduler.set_runtime(self.runtime)
 
         # Register backend adapters
@@ -60,7 +58,7 @@ class Daemon:
         self.runtime.register_backend(ClaudeAdapter())
         self.runtime.register_backend(CodexAdapter())
 
-        self.dispatcher = MethodDispatcher(self.scheduler, self.store, self.event_bus, config)
+        self.dispatcher = MethodDispatcher(self.scheduler, self.store, config)
 
     async def run(self) -> None:
         """Start daemon and run until shutdown signal."""
@@ -144,13 +142,10 @@ class Daemon:
         # 5. Stop all running turns
         await self.runtime.stop_all()
 
-        # 6. Close event bus
-        await self.event_bus.close()
-
-        # 7. Close store
+        # 6. Close store
         self.store.db.close()
 
-        # 8. Clean up files
+        # 7. Clean up files
         try:
             self.config.socket_path.unlink(missing_ok=True)
             self.config.pid_path.unlink(missing_ok=True)

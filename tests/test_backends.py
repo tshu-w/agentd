@@ -9,6 +9,7 @@ from agentd.runtime.backends.claude import ClaudeAdapter
 from agentd.runtime.backends.codex import CodexAdapter
 from agentd.runtime.backends.pi import PiAdapter
 
+
 @pytest.mark.parametrize("adapter", [PiAdapter(), ClaudeAdapter(), CodexAdapter()])
 def test_malformed_json_raises_for_runner_warning(adapter):
     with pytest.raises(json.JSONDecodeError):

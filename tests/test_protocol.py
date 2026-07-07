@@ -147,7 +147,7 @@ class TestEnumValues:
 
     def test_error_types(self):
         assert "not_found" in [e.value for e in ErrorType]
-        assert "slow_consumer" in [e.value for e in ErrorType]
+        assert "timeout" in [e.value for e in ErrorType]
 
     def test_root_scope(self):
         assert ROOT_SCOPE == "__root__"

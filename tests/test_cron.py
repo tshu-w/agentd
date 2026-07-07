@@ -1,11 +1,10 @@
-"""Tests for cron timezone and event_bus correctness."""
+"""Tests for cron timezone, duration parsing, and trigger firing."""
 
 from datetime import UTC, datetime
 
 import pytest
 
 from agentd.scheduler.cron import compute_next_fire
-from agentd.scheduler.event_bus import EventBus, SlowConsumerError
 
 # ---------------------------------------------------------------------------
 # Cron: local timezone interpretation
@@ -41,63 +40,6 @@ class TestCronTimezone:
         next_local = next_utc.astimezone(local_tz)
         assert next_local.hour == 14
         assert next_local.minute == 30
-
-
-# ---------------------------------------------------------------------------
-# EventBus: __aiter__ protocol
-# ---------------------------------------------------------------------------
-
-
-class TestSubscriptionAiter:
-    @pytest.mark.asyncio
-    async def test_async_for_works(self):
-        """Subscription must work with 'async for'."""
-        bus = EventBus()
-        sub = await bus.subscribe(actor_id="act_test")
-
-        # Publish two events then close
-        bus.publish({"actor_id": "act_test", "seq": 1, "type": "t", "payload": {}})
-        bus.publish({"actor_id": "act_test", "seq": 2, "type": "t", "payload": {}})
-        sub.close()
-
-        collected = []
-        async for event in sub:
-            collected.append(event)
-        assert len(collected) == 2
-
-    @pytest.mark.asyncio
-    async def test_async_for_filters_by_actor(self):
-        bus = EventBus()
-        sub = await bus.subscribe(actor_id="act_a")
-
-        bus.publish({"actor_id": "act_a", "seq": 1, "type": "t", "payload": {}})
-        bus.publish({"actor_id": "act_b", "seq": 2, "type": "t", "payload": {}})
-        sub.close()
-
-        collected = []
-        async for event in sub:
-            collected.append(event)
-        assert len(collected) == 1
-        assert collected[0]["actor_id"] == "act_a"
-
-    @pytest.mark.asyncio
-    async def test_overflow_delivers_sentinel(self):
-        """When queue fills up, consumer must get SlowConsumerError, not hang."""
-        bus = EventBus()
-        sub = await bus.subscribe(actor_id="act_x", since_seq=0)
-
-        # Fill queue beyond capacity
-        for i in range(300):
-            bus.publish({"actor_id": "act_x", "seq": i + 1, "type": "t", "payload": {}})
-
-        collected = []
-        with pytest.raises(SlowConsumerError):
-            async for event in sub:
-                collected.append(event)
-
-        # Should have received events up to capacity, then SlowConsumerError
-        assert len(collected) > 0
-        assert len(collected) < 300
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +99,7 @@ def _sched_env():
     db = Database(p)
     db.initialize()
     store = Store(db)
-    sch = Scheduler(store, EventBus(), AgentDConfig())
+    sch = Scheduler(store, AgentDConfig())
     return store, sch
 
 

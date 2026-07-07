@@ -25,7 +25,6 @@ from agentd.store import Store
 from .base import BackendAdapter
 
 if TYPE_CHECKING:
-    from agentd.scheduler.event_bus import EventBus
     from agentd.scheduler.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
@@ -209,12 +208,10 @@ class Runtime:
     def __init__(
         self,
         store: Store,
-        event_bus: EventBus,
         config: AgentDConfig,
         scheduler: Scheduler,
     ):
         self.store = store
-        self.event_bus = event_bus
         self.config = config
         self.scheduler = scheduler
         self._backends: dict[str, BackendAdapter] = {}

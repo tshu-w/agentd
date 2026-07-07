@@ -176,7 +176,6 @@ class ErrorType(StrEnum):
     BACKEND_ERROR = "backend_error"
     DAEMON_UNAVAILABLE = "daemon_unavailable"
     TIMEOUT = "timeout"
-    SLOW_CONSUMER = "slow_consumer"
     INVALID_PARAMS = "invalid_params"
 
 

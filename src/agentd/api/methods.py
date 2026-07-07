@@ -37,11 +37,14 @@ from agentd.scheduler.cron import (
     parse_duration,
     to_utc_iso,
 )
-from agentd.scheduler.event_bus import EventBus, SlowConsumerError
 from agentd.scheduler.scheduler import Scheduler, SchedulerError
 from agentd.store import Store
 
 logger = logging.getLogger(__name__)
+
+# Streaming interfaces (logs --follow, wait --progress, ps --watch) poll the
+# events table; WAL mode keeps readers from blocking the writer.
+EVENT_POLL_INTERVAL = 0.3
 
 
 class MethodDispatcher:
@@ -49,12 +52,10 @@ class MethodDispatcher:
         self,
         scheduler: Scheduler,
         store: Store,
-        event_bus: EventBus,
         config: AgentDConfig,
     ):
         self.scheduler = scheduler
         self.store = store
-        self.event_bus = event_bus
         self.config = config
 
         self._methods: dict[str, Any] = {
@@ -303,72 +304,42 @@ class MethodDispatcher:
         actor_id = actor["actor_id"]
 
         if p.progress:
-            # Subscribe FIRST to buffer live events during replay
-            sub = await self.event_bus.subscribe(
-                actor_id=actor_id,
-                since_seq=p.since_seq,
-            )
-            try:
-                # Replay recent events (limited window; full history via logs)
+            # Poll the events table: replay history, then follow until the
+            # actor settles (idle/closed) or the timeout hits.
+            last_sent_seq = p.since_seq
+            deadline = asyncio.get_event_loop().time() + p.timeout if p.timeout else None
+            first_pass = True
+            while True:
                 events = self.store.list_events(
                     actor_id,
-                    since_seq=p.since_seq,
-                    limit=20,
+                    since_seq=last_sent_seq,
+                    limit=20 if first_pass else 200,
                 )
-                last_sent_seq = p.since_seq
+                first_pass = False
                 for ev in events:
                     await _write(writer, make_stream_event(req_id, ev))
                     last_sent_seq = ev["seq"]
 
-                # Stream live events (deduplicate against replay)
-                deadline = asyncio.get_event_loop().time() + p.timeout if p.timeout else None
-                while True:
-                    # Check if actor is done
-                    current = self.store.get_actor(actor_id)
-                    if current and current["state"] in ("idle", "closed"):
-                        break
+                # Check if actor is done (after draining, so the final
+                # turn.end event is delivered before the stream ends)
+                current = self.store.get_actor(actor_id)
+                if current and current["state"] in ("idle", "closed"):
+                    break
 
-                    remaining = None
-                    if deadline:
-                        remaining = deadline - asyncio.get_event_loop().time()
-                        if remaining <= 0:
-                            await _write(
-                                writer,
-                                make_error(
-                                    req_id,
-                                    BUSINESS_ERROR,
-                                    "wait timed out",
-                                    ErrorType.TIMEOUT,
-                                ),
-                            )
-                            return
+                if deadline and asyncio.get_event_loop().time() >= deadline:
+                    await _write(
+                        writer,
+                        make_error(
+                            req_id,
+                            BUSINESS_ERROR,
+                            "wait timed out",
+                            ErrorType.TIMEOUT,
+                        ),
+                    )
+                    return
 
-                    try:
-                        event = await asyncio.wait_for(
-                            sub.__anext__(),
-                            timeout=min(remaining or 1.0, 1.0),
-                        )
-                        if event.get("seq", 0) <= last_sent_seq:
-                            continue
-                        await _write(writer, make_stream_event(req_id, event))
-                    except StopAsyncIteration:
-                        break
-                    except TimeoutError:
-                        continue
-                    except SlowConsumerError:
-                        await _write(
-                            writer,
-                            make_error(
-                                req_id,
-                                BUSINESS_ERROR,
-                                "slow consumer",
-                                ErrorType.SLOW_CONSUMER,
-                                data={"resume_seq": self.store.get_max_seq()},
-                            ),
-                        )
-                        return
-            finally:
-                await self.event_bus.unsubscribe(sub)
+                if not events:
+                    await asyncio.sleep(EVENT_POLL_INTERVAL)
 
             # Send final result
             result = self.scheduler._wait_result(actor_id)
@@ -407,58 +378,20 @@ class MethodDispatcher:
             return
 
         if p.watch:
-            # Streaming mode
-            sub = await self.event_bus.subscribe()
+            # Streaming mode: poll snapshots and push on change
             try:
-                # Send initial snapshot
-                actors = self.store.list_actors(
-                    include_terminal=p.include_terminal,
-                    limit=p.limit,
-                )
-                await _write(writer, make_stream_event(req_id, {"actors": actors}))
-
-                # Stream updates
+                prev: list[dict] | None = None
                 while True:
-                    try:
-                        event = await asyncio.wait_for(sub.__anext__(), timeout=5.0)
-                        etype = event.get("event_type", "")
-                        if etype in (
-                            "actor.spawned",
-                            "actor.closed",
-                            "turn.opened",
-                            "turn.end",
-                        ):
-                            actors = self.store.list_actors(
-                                include_terminal=p.include_terminal,
-                                limit=p.limit,
-                            )
-                            await _write(
-                                writer,
-                                make_stream_event(
-                                    req_id,
-                                    {"actors": actors},
-                                ),
-                            )
-                    except TimeoutError:
-                        continue
-                    except StopAsyncIteration:
-                        break
-                    except SlowConsumerError:
-                        await _write(
-                            writer,
-                            make_error(
-                                req_id,
-                                BUSINESS_ERROR,
-                                "slow consumer",
-                                ErrorType.SLOW_CONSUMER,
-                                data={"resume_seq": self.store.get_max_seq()},
-                            ),
-                        )
-                        return
+                    actors = self.store.list_actors(
+                        include_terminal=p.include_terminal,
+                        limit=p.limit,
+                    )
+                    if actors != prev:
+                        await _write(writer, make_stream_event(req_id, {"actors": actors}))
+                        prev = actors
+                    await asyncio.sleep(1.0)
             except (ConnectionResetError, BrokenPipeError):
                 pass
-            finally:
-                await self.event_bus.unsubscribe(sub)
         else:
             actors = self.store.list_actors(
                 include_terminal=p.include_terminal,
@@ -496,13 +429,9 @@ class MethodDispatcher:
         actor_id = actor["actor_id"]
 
         if p.follow:
-            # Subscribe FIRST to buffer live events during replay
-            sub = await self.event_bus.subscribe(
-                actor_id=actor_id,
-                since_seq=p.since_seq,
-            )
+            # Poll the events table: replay history (respecting p.limit for
+            # the initial window), then follow the tail indefinitely.
             try:
-                # Replay historical events
                 events = self.store.list_events(
                     actor_id,
                     since_seq=p.since_seq,
@@ -513,33 +442,19 @@ class MethodDispatcher:
                     await _write(writer, make_stream_event(req_id, ev))
                     last_sent_seq = ev["seq"]
 
-                # Stream live events (deduplicate against replay)
                 while True:
-                    try:
-                        event = await asyncio.wait_for(sub.__anext__(), timeout=5.0)
-                        if event.get("seq", 0) <= last_sent_seq:
-                            continue
-                        await _write(writer, make_stream_event(req_id, event))
-                    except TimeoutError:
-                        continue
-                    except StopAsyncIteration:
-                        break
-                    except SlowConsumerError:
-                        await _write(
-                            writer,
-                            make_error(
-                                req_id,
-                                BUSINESS_ERROR,
-                                "slow consumer",
-                                ErrorType.SLOW_CONSUMER,
-                                data={"resume_seq": self.store.get_max_seq()},
-                            ),
-                        )
-                        return
+                    events = self.store.list_events(
+                        actor_id,
+                        since_seq=last_sent_seq,
+                        limit=200,
+                    )
+                    for ev in events:
+                        await _write(writer, make_stream_event(req_id, ev))
+                        last_sent_seq = ev["seq"]
+                    if not events:
+                        await asyncio.sleep(EVENT_POLL_INTERVAL)
             except (ConnectionResetError, BrokenPipeError):
                 pass
-            finally:
-                await self.event_bus.unsubscribe(sub)
         else:
             events = self.store.list_events(
                 actor_id,

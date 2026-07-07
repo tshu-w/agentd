@@ -249,7 +249,7 @@ Turn 结束后按以下步骤处理：
 
 ### 术语定义
 
-- **公共事件（public event）**：跨越 daemon 边界进入持久化事件日志（`events` 表）和 EventBus、对外部 client（`agentd logs`、`agentd wait --progress`、channel）可见的事件。在此边界之前的内容（backend 原始记录、runtime 内部状态、debug 日志）不算公共事件。
+- **公共事件（public event）**：跨越 daemon 边界进入持久化事件日志（`events` 表）、对外部 client（`agentd logs`、`agentd wait --progress`、channel）可见的事件。在此边界之前的内容（backend 原始记录、runtime 内部状态、debug 日志）不算公共事件。
 - **Canonical schema（规范化结构）**：本节（§4）为每种事件类型定义的 payload 结构。`turn.progress` 各子类型、`turn.end` 的 payload 等都是 canonical schema。公共事件必须只使用 canonical schema。
 - **Backend 原始事件（raw backend event）**：backend CLI 在 stdout 上发出的 JSON 对象，使用 backend 自身私有格式（如 pi 的 `message_update.assistantMessageEvent`、codex 的 `item.completed`、claude 的 `assistant.content`）。Backend 原始事件是 adapter normalization 的输入。
 
@@ -312,7 +312,7 @@ Turn 结束后按以下步骤处理：
       {"jsonrpc": "2.0", "id": "req-2", "result": {...}, "done": true}
 ```
 
-错误码：协议级错误用 JSON-RPC 2.0 标准码（-32700 parse error, -32600 invalid request, -32601 method not found, -32602 invalid params, -32603 internal error）。业务错误统一用 -32000，具体类型放 `error.data.type`：`not_found` / `actor_closed` / `conflict` / `forbidden` / `backend_error` / `daemon_unavailable` / `timeout` / `slow_consumer`
+错误码：协议级错误用 JSON-RPC 2.0 标准码（-32700 parse error, -32600 invalid request, -32601 method not found, -32602 invalid params, -32603 internal error）。业务错误统一用 -32000，具体类型放 `error.data.type`：`not_found` / `actor_closed` / `conflict` / `forbidden` / `backend_error` / `daemon_unavailable` / `timeout`
 
 交付语义：RPC 成功返回 = 相关 DB 事务已提交。客户端超时 = 结果未知，应通过查询确认。
 
@@ -380,16 +380,6 @@ Turn 结束后按以下步骤处理：
 参数：`actor`, `since_seq`, `follow`, `limit`。
 
 权威事件流接口。非 follow 模式返回历史事件快照；follow 模式先回放历史（受 `limit` 控制），然后持续推送 live 事件。这是"完整历史 + future"的主要入口。
-
-#### 慢消费者（Slow Consumer）
-
-所有流式接口（`logs --follow`、`wait --progress`、`ps --watch`）均使用有界 per-subscriber 队列。当客户端消费速度跟不上事件产出速度时，服务端返回 `slow_consumer` 错误并附带 `resume_seq`：
-
-```json
-{"jsonrpc": "2.0", "id": "req-1", "error": {"code": -32000, "message": "slow consumer", "data": {"type": "slow_consumer", "resume_seq": 142}}}
-```
-
-对于事件流（`logs --follow`、`wait --progress`），客户端应使用 `resume_seq` 作为下次请求的 `since_seq` 进行重连。注意 `resume_seq` 指向当前全局尾部，上次消费位置与 `resume_seq` 之间的事件可能被跳过。对于快照流（`ps --watch`），客户端重新发起 watch 请求即可获取最新快照。
 
 #### `actor.status`
 
@@ -571,7 +561,7 @@ Backend adapter 通用契约和各 adapter 实现见 §10。
 src/agentd/
 ├── cli/           → CLI 入口、参数解析
 ├── api/           → Daemon API server（RPC 处理）
-├── scheduler/     → Scheduler（状态机、turn 管理、EventBus）
+├── scheduler/     → Scheduler（状态机、turn 管理）
 ├── runtime/       → Runtime（进程执行、backend adapters）
 │   └── backends/
 ├── store/         → Store（SQLite 持久化）
@@ -579,9 +569,9 @@ src/agentd/
 └── protocol.py    → 共享类型定义（RPC 信封、错误码）
 ```
 
-### 流式订阅背压
+### 流式交付
 
-`logs --follow`、`ps --watch`、`wait --progress` 等流式订阅订阅的是 daemon 内部公共事件流（§4），不是 backend 原始事件。每个 subscriber 使用按条数限制的 queue。溢出时断开该 subscriber（返回 `slow_consumer` 错误）。对于事件流（`logs --follow`、`wait --progress`），客户端通过 `since_seq` 从最新位置恢复订阅，中间事件可能被跳过。对于快照流（`ps --watch`），客户端重新发起 watch 请求即可获取最新快照。
+`logs --follow`、`ps --watch`、`wait --progress` 交付的是 daemon 公共事件流（§4），不是 backend 原始事件。`events` 表是唯一事件通道：流式 handler 按 `seq` 轮询它（WAL 模式下读不阻塞写），因此交付无缝隙、有序，不存在会溢出的订阅队列。断开后客户端通过 `since_seq` 恢复；快照流（`ps --watch`）重新发起 watch 请求即可。
 
 ### Transport 大小限制
 
@@ -608,7 +598,7 @@ SIGTERM / SIGINT 均触发以下序列：
 3. 对所有 running turns 发 stop
 4. 带超时等待所有 turns 结束
 5. 超时后强制 terminate 残留进程
-6. 关闭 EventBus、Store
+6. 关闭 Store
 
 ### Startup reconciliation
 
@@ -831,7 +821,6 @@ Channel 特有的格式化（如 Telegram message 结构展开）由 channel ada
 | Actor 不存在 | -32000，`data.type=not_found` |
 | 状态冲突（如 emit closed actor） | -32000，`data.type=conflict` |
 | Backend 启动失败 | -32000，`data.type=backend_error` |
-| 流式订阅消费者过慢被断开 | -32000，`data.type=slow_consumer` |
 
 ### Scheduler 层
 
@@ -839,7 +828,6 @@ Channel 特有的格式化（如 Telegram message 结构展开）由 channel ada
 |---|---|
 | Turn 开启失败 | `turn.end(outcome=failed)`，actor 回 `idle` |
 | 状态迁移违反不变量 | 记录错误日志，拒绝操作，不静默吞掉 |
-| 并发上限已满 | 新 turn 保持 `pending` 排队 |
 
 ### Runtime 层
 

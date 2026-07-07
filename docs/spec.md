@@ -249,7 +249,7 @@ After a turn ends, process in the following order:
 
 ### Definitions
 
-- **Public event**: an event that crosses the daemon boundary into the persisted event log (`events` table) and the EventBus, becoming visible to external clients (`agentd logs`, `agentd wait --progress`, channels). Anything before this boundary (raw backend records, runtime internal state, debug logs) is not a public event.
+- **Public event**: an event that crosses the daemon boundary into the persisted event log (`events` table), becoming visible to external clients (`agentd logs`, `agentd wait --progress`, channels). Anything before this boundary (raw backend records, runtime internal state, debug logs) is not a public event.
 - **Canonical schema**: the payload structure defined by this section (§4) for each event type. Each `turn.progress` subtype, the `turn.end` payload, etc. are canonical schemas. Public events MUST use canonical schemas only.
 - **Raw backend event**: the JSON object emitted by a backend CLI on its stdout, in that backend's own private format (e.g., pi's `message_update.assistantMessageEvent`, codex's `item.completed`, claude's `assistant.content`). Raw backend events are adapter normalization inputs.
 
@@ -312,7 +312,7 @@ Stream:   {"jsonrpc": "2.0", "id": "req-2", "event": {...}, "done": false}
           {"jsonrpc": "2.0", "id": "req-2", "result": {...}, "done": true}
 ```
 
-Error codes: protocol-level errors use JSON-RPC 2.0 standard codes (-32700 parse error, -32600 invalid request, -32601 method not found, -32602 invalid params, -32603 internal error). Business errors use -32000 uniformly, with specific type in `error.data.type`: `not_found` / `actor_closed` / `conflict` / `forbidden` / `backend_error` / `daemon_unavailable` / `timeout` / `slow_consumer`
+Error codes: protocol-level errors use JSON-RPC 2.0 standard codes (-32700 parse error, -32600 invalid request, -32601 method not found, -32602 invalid params, -32603 internal error). Business errors use -32000 uniformly, with specific type in `error.data.type`: `not_found` / `actor_closed` / `conflict` / `forbidden` / `backend_error` / `daemon_unavailable` / `timeout`
 
 Delivery semantics: RPC success return = relevant DB transaction committed. Client timeout = outcome unknown; client should confirm via query.
 
@@ -380,16 +380,6 @@ Parameters: `include_terminal`, `watch`, `limit`. Watch mode streams snapshots.
 Parameters: `actor`, `since_seq`, `follow`, `limit`.
 
 The authoritative event stream interface. Non-follow mode returns a historical event snapshot; follow mode replays history (controlled by `limit`), then continuously pushes live events. This is the primary entry point for "full history + future".
-
-#### Slow Consumer
-
-All streaming interfaces (`logs --follow`, `wait --progress`, `ps --watch`) use bounded per-subscriber queues. When a client cannot keep up with event production, the server returns a `slow_consumer` error with `resume_seq`:
-
-```json
-{"jsonrpc": "2.0", "id": "req-1", "error": {"code": -32000, "message": "slow consumer", "data": {"type": "slow_consumer", "resume_seq": 142}}}
-```
-
-For event streams (`logs --follow`, `wait --progress`), clients should use `resume_seq` as `since_seq` for reconnection. Note that `resume_seq` points to the current global tail; events between the last consumed seq and `resume_seq` may be skipped. For snapshot streams (`ps --watch`), clients simply re-issue the watch request to receive a fresh snapshot.
 
 #### `actor.status`
 
@@ -571,7 +561,7 @@ Backend adapter contract and per-adapter implementation details in §10.
 src/agentd/
 ├── cli/           → CLI entry, argument parsing
 ├── api/           → Daemon API server (RPC handling)
-├── scheduler/     → Scheduler (state machine, turn management, EventBus)
+├── scheduler/     → Scheduler (state machine, turn management)
 ├── runtime/       → Runtime (process execution, backend adapters)
 │   └── backends/
 ├── store/         → Store (SQLite persistence)
@@ -579,9 +569,9 @@ src/agentd/
 └── protocol.py    → Shared type definitions (RPC envelope, error codes)
 ```
 
-### Streaming Subscription Backpressure
+### Streaming Delivery
 
-`logs --follow`, `ps --watch`, `wait --progress` subscribe to the daemon's internal public event stream (§4), not backend raw events. Each subscriber uses a count-bound queue. On overflow the subscriber is disconnected (returns `slow_consumer` error). For event streams (`logs --follow`, `wait --progress`), clients reconnect via `since_seq` to resume from the latest position; intermediate events may be skipped. For snapshot streams (`ps --watch`), clients re-issue the watch request to receive a fresh snapshot.
+`logs --follow`, `ps --watch`, `wait --progress` deliver the daemon's public event stream (§4), not backend raw events. The `events` table is the single event channel: streaming handlers poll it by `seq` (WAL mode keeps readers from blocking the writer), so delivery is gapless and ordered with no subscriber queues to overflow. Clients resume after disconnect via `since_seq`; snapshot streams (`ps --watch`) simply re-issue the watch request.
 
 ### Transport Size Limits
 
@@ -608,7 +598,7 @@ SIGTERM / SIGINT both trigger the following sequence:
 3. Send stop to all running turns
 4. Wait for all turns to end with timeout
 5. Force terminate remaining processes after timeout
-6. Close EventBus, Store
+6. Close Store
 
 ### Startup Reconciliation
 
@@ -831,7 +821,6 @@ Channel-specific formatting (e.g., Telegram message structure expansion) is done
 | Actor not found | -32000, `data.type=not_found` |
 | State conflict (e.g., emit to closed actor) | -32000, `data.type=conflict` |
 | Backend start failure | -32000, `data.type=backend_error` |
-| Streaming subscriber too slow, disconnected | -32000, `data.type=slow_consumer` |
 
 ### Scheduler Layer
 
@@ -839,7 +828,6 @@ Channel-specific formatting (e.g., Telegram message structure expansion) is done
 |---|---|
 | Turn opening failure | `turn.end(outcome=failed)`, actor back to `idle` |
 | State transition violates invariant | Log error, reject operation, do not silently swallow |
-| Concurrency limit reached | New turn stays `pending` in queue |
 
 ### Runtime Layer
 

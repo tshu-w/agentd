@@ -8,7 +8,6 @@ import pytest
 
 from agentd.config import AgentDConfig
 from agentd.protocol import ROOT_SCOPE, EventType, TurnOutcome, TurnState
-from agentd.scheduler.event_bus import EventBus
 from agentd.scheduler.scheduler import Scheduler
 from agentd.store.db import Database
 from agentd.store.store import Store
@@ -16,15 +15,14 @@ from agentd.store.store import Store
 
 @pytest.fixture
 def env():
-    """Provide (store, bus, scheduler)."""
+    """Provide (store, scheduler)."""
     p = Path(tempfile.mkdtemp()) / "t.db"
     db = Database(p)
     db.initialize()
     store = Store(db)
-    bus = EventBus()
     cfg = AgentDConfig()
-    sch = Scheduler(store, bus, cfg)
-    return store, bus, sch
+    sch = Scheduler(store, cfg)
+    return store, sch
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +32,7 @@ def env():
 
 @pytest.mark.asyncio
 async def test_emit_without_runtime_creates_pending_turn(env):
-    store, _bus, sch = env
+    store, sch = env
 
     a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
     result = await sch.emit(actor_id=a["actor_id"], msg_type="message", msg_payload={"text": "hi"})
@@ -59,7 +57,7 @@ async def test_emit_without_runtime_creates_pending_turn(env):
 
 @pytest.mark.asyncio
 async def test_same_actor_wakeup_chain(env):
-    store, _bus, sch = env
+    store, sch = env
 
     a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
     # First message → turn
@@ -88,7 +86,7 @@ async def test_same_actor_wakeup_chain(env):
 
 @pytest.mark.asyncio
 async def test_reconcile_running_turn_acks_message(env):
-    store, _bus, sch = env
+    store, sch = env
 
     a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
     store.add_message(a["actor_id"], "message", {"text": "hi"})
@@ -131,7 +129,7 @@ class _FakeRuntime:
 @pytest.mark.asyncio
 async def test_no_double_dispatch_on_turn_complete(env):
     """Same-actor wakeup on turn completion must not dispatch the same turn twice."""
-    store, _bus, sch = env
+    store, sch = env
     rt = _FakeRuntime()
     sch.set_runtime(rt)
 
@@ -150,20 +148,6 @@ async def test_no_double_dispatch_on_turn_complete(env):
     assert len(turn_ids) == len(set(turn_ids)), f"duplicate dispatch: {turn_ids}"
 
 
-@pytest.mark.asyncio
-async def test_live_event_envelope_uses_event_type_only(env):
-    _store, bus, sch = env
-    sub = await bus.subscribe(actor_id="act_test")
-
-    sch._publish_event("act_test", "turn_test", "turn.progress", {"type": "thinking"}, 1)
-
-    event = await sub.__anext__()
-    assert event["event_type"] == "turn.progress"
-    assert "type" not in event
-
-    await bus.unsubscribe(sub)
-
-
 # ---------------------------------------------------------------------------
 # Reconcile env recovery
 # ---------------------------------------------------------------------------
@@ -172,7 +156,7 @@ async def test_live_event_envelope_uses_event_type_only(env):
 @pytest.mark.asyncio
 async def test_reconcile_recovers_env_overlay(env):
     """Pending turn's emit.env should survive daemon restart via the mailbox env column."""
-    store, _bus, sch = env
+    store, sch = env
     # No runtime attached → dispatch no-ops → turn stays pending
 
     a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
@@ -185,7 +169,7 @@ async def test_reconcile_recovers_env_overlay(env):
     assert store.get_active_turn(a["actor_id"])["state"] == "pending"
 
     # Simulate restart: new scheduler, same DB
-    sch2 = Scheduler(store, EventBus(), sch.config)
+    sch2 = Scheduler(store, sch.config)
     rt2 = _FakeRuntime()
     sch2.set_runtime(rt2)  # ty: ignore[invalid-argument-type]
     await sch2.reconcile()
@@ -202,11 +186,11 @@ async def test_reconcile_recovers_env_overlay(env):
 
 @pytest.mark.asyncio
 async def test_no_duplicate_turn_end_event(env):
-    store, _bus, sch = env
+    store, sch = env
     from agentd.protocol import EventType, ParsedLine
     from agentd.runtime.runner import Runtime
 
-    rt = Runtime(store, _bus, sch.config, sch)
+    rt = Runtime(store, sch.config, sch)
     sch.set_runtime(rt)
 
     a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
@@ -233,7 +217,7 @@ async def test_no_duplicate_turn_end_event(env):
 @pytest.mark.asyncio
 async def test_stop_pending_turn(env):
     """actor.stop must end a pending (not yet running) turn and transition actor → idle."""
-    store, _bus, sch = env
+    store, sch = env
 
     rt = _FakeRuntime()
     sch.set_runtime(rt)
@@ -284,7 +268,7 @@ def _all_messages(store, actor_id: str) -> list[dict]:
 @pytest.mark.asyncio
 async def test_notify_parent_on_success(env):
     """Successful child turn.end auto-emits env.turn_completed and wakes the parent."""
-    store, _bus, sch = env
+    store, sch = env
 
     parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
     child = store.create_actor(
@@ -318,7 +302,7 @@ async def test_notify_parent_on_success(env):
 @pytest.mark.asyncio
 async def test_notify_parent_on_failure(env):
     """Failed child turn still notifies parent so supervisor can react."""
-    store, _bus, sch = env
+    store, sch = env
 
     parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
     child = store.create_actor(
@@ -343,7 +327,7 @@ async def test_notify_parent_on_failure(env):
 @pytest.mark.asyncio
 async def test_notify_suppressed_on_user_termination(env):
     """User-initiated stop/cancel should not generate turn_completed noise."""
-    store, _bus, sch = env
+    store, sch = env
 
     parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
     child = store.create_actor(
@@ -363,7 +347,7 @@ async def test_notify_suppressed_on_user_termination(env):
 @pytest.mark.asyncio
 async def test_notify_skipped_when_parent_closed(env):
     """Closed parent must not receive notifications."""
-    store, _bus, sch = env
+    store, sch = env
 
     parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
     child = store.create_actor(
@@ -393,7 +377,7 @@ async def test_notify_skipped_when_parent_closed(env):
 @pytest.mark.asyncio
 async def test_notify_delivers_final_text_result_to_parent(env):
     """Child final text result is delivered with the completion notification."""
-    store, _bus, sch = env
+    store, sch = env
     parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
     child = store.create_actor(
         name="worker",
@@ -415,7 +399,7 @@ async def test_notify_delivers_final_text_result_to_parent(env):
 @pytest.mark.asyncio
 async def test_notify_queues_when_parent_active(env):
     """If parent is mid-turn, env.turn_completed queues for the next turn."""
-    store, _bus, sch = env
+    store, sch = env
 
     parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
     child = store.create_actor(
@@ -445,7 +429,7 @@ async def test_notify_queues_when_parent_active(env):
 @pytest.mark.asyncio
 async def test_notify_does_not_propagate_to_grandparent(env):
     """Notifications target the immediate parent only — no transitive forwarding."""
-    store, _bus, sch = env
+    store, sch = env
 
     gp = store.create_actor(name="gp", scope_id=ROOT_SCOPE, backend="pi")
     parent = store.create_actor(
@@ -474,7 +458,7 @@ async def test_notify_does_not_propagate_to_grandparent(env):
 @pytest.mark.asyncio
 async def test_root_actor_does_not_self_emit(env):
     """Actors without a parent never trigger env.turn_completed."""
-    store, _bus, sch = env
+    store, sch = env
 
     a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
     await sch.emit(actor_id=a["actor_id"], msg_type="message", msg_payload={"text": "go"})
@@ -492,7 +476,7 @@ async def test_notify_exception_does_not_block_scheduler(env, monkeypatch):
     The child's turn.end is already persisted; the notification exception is
     swallowed so the child settles cleanly.
     """
-    store, _bus, sch = env
+    store, sch = env
 
     parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
     child = store.create_actor(
@@ -529,7 +513,7 @@ async def test_notify_exception_does_not_block_scheduler(env, monkeypatch):
 @pytest.mark.asyncio
 async def test_reconcile_notifies_parent_of_restart_failure(env):
     """Turns force-failed by daemon-restart reconcile must still notify the parent."""
-    store, _bus, sch = env
+    store, sch = env
 
     parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
     child = store.create_actor(
@@ -561,7 +545,7 @@ async def test_reconcile_notifies_parent_of_restart_failure(env):
 @pytest.mark.asyncio
 async def test_reconcile_notify_skips_closed_parent(env):
     """Enqueue-only notify path must tolerate a closed parent."""
-    store, _bus, sch = env
+    store, sch = env
 
     parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
     child = store.create_actor(
@@ -589,7 +573,7 @@ async def test_reconcile_notify_skips_closed_parent(env):
 @pytest.mark.asyncio
 async def test_emit_event_seq_anchors_before_own_events(env):
     """Replaying events > event_seq must include this emit's own turn.opened."""
-    store, _bus, sch = env
+    store, sch = env
 
     a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
     # Unrelated actor appends an event first so max_seq > 0.
@@ -610,7 +594,7 @@ async def test_emit_event_seq_anchors_before_own_events(env):
 @pytest.mark.asyncio
 async def test_env_survives_daemon_restart(env):
     """Actor env and queued message env must survive a scheduler restart."""
-    store, bus, sch = env
+    store, sch = env
 
     r = await sch.spawn(name="worker", backend="pi", env={"SECRET": "s3cr3t"})
     actor_id = r["actor_id"]
@@ -623,7 +607,7 @@ async def test_env_survives_daemon_restart(env):
 
     # Fresh scheduler over the same store = daemon restart
     cfg = AgentDConfig()
-    sch2 = Scheduler(store, bus, cfg)
+    sch2 = Scheduler(store, cfg)
     rt = _FakeRuntime()
     sch2.set_runtime(rt)  # ty: ignore[invalid-argument-type]
     await sch2.reconcile()
@@ -638,7 +622,7 @@ async def test_env_survives_daemon_restart(env):
 @pytest.mark.asyncio
 async def test_turn_opened_snapshot_has_env_keys_not_values(env):
     """turn.opened input snapshots must never persist env values."""
-    store, _bus, sch = env
+    store, sch = env
     rt = _FakeRuntime()
     sch.set_runtime(rt)
 
