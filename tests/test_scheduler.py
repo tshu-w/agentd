@@ -16,27 +16,25 @@ from agentd.store.store import Store
 
 @pytest.fixture
 def env():
-    """Provide (store, bus, scheduler) with max_total_workers=2."""
+    """Provide (store, bus, scheduler)."""
     p = Path(tempfile.mkdtemp()) / "t.db"
     db = Database(p)
     db.initialize()
     store = Store(db)
     bus = EventBus()
     cfg = AgentDConfig()
-    cfg.limits.max_total_workers = 2
     sch = Scheduler(store, bus, cfg)
     return store, bus, sch
 
 
 # ---------------------------------------------------------------------------
-# Concurrency limit: pending turn creation
+# Pending turn without runtime (reconcile relies on this)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_capacity_full_creates_pending_turn(env):
+async def test_emit_without_runtime_creates_pending_turn(env):
     store, _bus, sch = env
-    sch._running_count = 2  # full
 
     a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
     result = await sch.emit(actor_id=a["actor_id"], msg_type="message", msg_payload={"text": "hi"})
@@ -52,34 +50,6 @@ async def test_capacity_full_creates_pending_turn(env):
     # Message claimed, not queued
     assert store.count_queued(a["actor_id"]) == 0
     assert store.get_claimed_message(a["actor_id"]) is not None
-
-
-@pytest.mark.asyncio
-async def test_capacity_release_preserves_pending_turn_without_runtime(env):
-    store, _bus, sch = env
-
-    # Actor A occupies a slot
-    a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
-    store.add_message(a["actor_id"], "message", {"text": "a"})
-    turn_a, msg_a = store.open_turn_atomic(a["actor_id"])
-    store.transition_turn(turn_a["turn_id"], TurnState.RUNNING)
-    sch._running_count = 2  # both slots full
-
-    # Actor B gets a pending turn (capacity full)
-    b = store.create_actor(name="b", scope_id=ROOT_SCOPE, backend="pi")
-    await sch.emit(actor_id=b["actor_id"], msg_type="message", msg_payload={"text": "b"})
-    assert store.get_active_turn(b["actor_id"])["state"] == "pending"
-
-    # A completes → frees a slot → run the scheduling path for B
-    sch._running_count = 2
-    await sch.on_turn_completed(turn_a["turn_id"], outcome=TurnOutcome.SUCCEEDED)
-
-    # Without a runtime, B should remain a valid pending turn
-    b_turn = store.get_active_turn(b["actor_id"])
-    assert b_turn is not None
-    assert b_turn["state"] == "pending"
-    actor_b = store.get_actor(b["actor_id"])
-    assert actor_b["state"] == "active"
 
 
 # ---------------------------------------------------------------------------
@@ -136,44 +106,6 @@ async def test_reconcile_running_turn_acks_message(env):
     assert store.list_idle_actors_with_queued() == []
 
 
-@pytest.mark.asyncio
-async def test_reconcile_pending_turn_respects_capacity(env):
-    store, _bus, sch = env
-    sch._running_count = 2  # full
-
-    a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
-    store.add_message(a["actor_id"], "message", {"text": "hi"})
-    store.open_turn_atomic(a["actor_id"])  # actor → active, msg → claimed
-
-    await sch.reconcile()
-
-    # Turn stays pending (no dispatch at full capacity)
-    turn = store.get_active_turn(a["actor_id"])
-    assert turn is not None
-    assert turn["state"] == "pending"
-
-
-# ---------------------------------------------------------------------------
-# Close subtree: running_count correctness
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_close_pending_turn_does_not_decrement_running_count(env):
-    store, _bus, sch = env
-    sch._running_count = 2  # full
-
-    a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
-    await sch.emit(actor_id=a["actor_id"], msg_type="message", msg_payload={"text": "hi"})
-    turn = store.get_active_turn(a["actor_id"])
-    assert turn["state"] == "pending"
-
-    before = sch._running_count
-    await sch.close(a["actor_id"])
-    # Closing a pending (never-dispatched) turn must NOT decrement _running_count
-    assert sch._running_count == before
-
-
 # ---------------------------------------------------------------------------
 # No double dispatch
 # ---------------------------------------------------------------------------
@@ -198,7 +130,7 @@ class _FakeRuntime:
 
 @pytest.mark.asyncio
 async def test_no_double_dispatch_on_turn_complete(env):
-    """Same-actor wakeup + _try_schedule_waiting must not dispatch same turn twice."""
+    """Same-actor wakeup on turn completion must not dispatch the same turn twice."""
     store, _bus, sch = env
     rt = _FakeRuntime()
     sch.set_runtime(rt)
@@ -207,7 +139,6 @@ async def test_no_double_dispatch_on_turn_complete(env):
     store.add_message(a["actor_id"], "message", {"text": "m1"})
     t1, msg1 = store.open_turn_atomic(a["actor_id"])
     store.transition_turn(t1["turn_id"], TurnState.RUNNING)
-    sch._running_count = 1
 
     # m2 queued while a is active
     await sch.emit(actor_id=a["actor_id"], msg_type="message", msg_payload={"text": "m2"})
@@ -240,11 +171,9 @@ async def test_live_event_envelope_uses_event_type_only(env):
 
 @pytest.mark.asyncio
 async def test_reconcile_recovers_env_overlay(env):
-    """Pending turn's emit.env should survive daemon restart via turn.opened snapshot."""
+    """Pending turn's emit.env should survive daemon restart via the mailbox env column."""
     store, _bus, sch = env
-    sch.config.limits.max_total_workers = 0  # force all turns pending
-    rt1 = _FakeRuntime()
-    sch.set_runtime(rt1)
+    # No runtime attached → dispatch no-ops → turn stays pending
 
     a = store.create_actor(name="a", scope_id=ROOT_SCOPE, backend="pi")
     await sch.emit(
@@ -253,11 +182,10 @@ async def test_reconcile_recovers_env_overlay(env):
         msg_payload={"text": "hi"},
         env={"SECRET": "42"},
     )
-    assert len(rt1.calls) == 0  # not dispatched (capacity=0)
+    assert store.get_active_turn(a["actor_id"])["state"] == "pending"
 
     # Simulate restart: new scheduler, same DB
     sch2 = Scheduler(store, EventBus(), sch.config)
-    sch2.config.limits.max_total_workers = 2
     rt2 = _FakeRuntime()
     sch2.set_runtime(rt2)  # ty: ignore[invalid-argument-type]
     await sch2.reconcile()
@@ -304,9 +232,8 @@ async def test_no_duplicate_turn_end_event(env):
 
 @pytest.mark.asyncio
 async def test_stop_pending_turn(env):
-    """actor.stop must end a capacity-blocked pending turn and transition actor → idle."""
+    """actor.stop must end a pending (not yet running) turn and transition actor → idle."""
     store, _bus, sch = env
-    sch.config.limits.max_total_workers = 0  # force all turns to stay pending
 
     rt = _FakeRuntime()
     sch.set_runtime(rt)
@@ -559,55 +486,11 @@ async def test_root_actor_does_not_self_emit(env):
 
 
 @pytest.mark.asyncio
-async def test_notify_survives_capacity_pressure(env):
-    """Notification path must work even when global worker capacity is saturated.
-
-    The parent's wakeup turn may stay pending (no dispatch slot), but the
-    mailbox message must still land and the parent must transition to ACTIVE.
-    """
-    store, _bus, sch = env
-    sch.config.limits.max_total_workers = 1
-    rt = _FakeRuntime()
-    sch.set_runtime(rt)
-
-    parent = store.create_actor(name="sup", scope_id=ROOT_SCOPE, backend="pi")
-    child = store.create_actor(
-        name="worker",
-        scope_id=parent["actor_id"],
-        backend="pi",
-        parent_actor_id=parent["actor_id"],
-    )
-
-    # Saturate the single dispatch slot with an unrelated running turn.
-    blocker = store.create_actor(name="blocker", scope_id=ROOT_SCOPE, backend="pi")
-    await sch.emit(actor_id=blocker["actor_id"], msg_type="message", msg_payload={"text": "hold"})
-    assert sch._running_count == 1
-
-    # Run the child turn to completion (manually, since we're not exercising
-    # runtime here — the open path counts toward _running_count, then
-    # on_turn_completed releases it before notify runs).
-    await sch.emit(actor_id=child["actor_id"], msg_type="message", msg_payload={"text": "go"})
-    turn = store.get_active_turn(child["actor_id"])
-    await sch.on_turn_completed(turn["turn_id"], outcome=TurnOutcome.SUCCEEDED, result="ok")
-
-    # Mailbox got the notification.
-    msgs = _all_messages(store, parent["actor_id"])
-    assert any(m["message_type"] == "env.turn_completed" for m in msgs)
-    # Parent woke up to ACTIVE; its turn may be running (slot was released by
-    # the child completing) or pending depending on scheduling order, but the
-    # actor itself must not be stuck IDLE with a queued message.
-    assert store.get_actor(parent["actor_id"])["state"] == "active"
-    assert store.get_active_turn(parent["actor_id"]) is not None
-    assert sch._running_count == 1
-
-
-@pytest.mark.asyncio
 async def test_notify_exception_does_not_block_scheduler(env, monkeypatch):
     """A failed parent notification must not break on_turn_completed.
 
-    The child's turn.end is already persisted; swallowing the notification
-    exception preserves the global liveness invariant that
-    `_try_schedule_waiting` always runs.
+    The child's turn.end is already persisted; the notification exception is
+    swallowed so the child settles cleanly.
     """
     store, _bus, sch = env
 
@@ -631,18 +514,8 @@ async def test_notify_exception_does_not_block_scheduler(env, monkeypatch):
 
     monkeypatch.setattr(sch, "emit", emit_router)
 
-    schedule_calls: list[bool] = []
-    original_try_schedule = sch._try_schedule_waiting
-
-    async def tracking_try_schedule():
-        schedule_calls.append(True)
-        return await original_try_schedule()
-
-    monkeypatch.setattr(sch, "_try_schedule_waiting", tracking_try_schedule)
-
     # Must not raise — exception swallowed inside _notify_parent_turn_completed.
     await sch.on_turn_completed(turn["turn_id"], outcome=TurnOutcome.SUCCEEDED, result="ok")
-    assert schedule_calls
 
     # Child completed cleanly: turn ended, actor idle, no env.turn_completed
     # in parent (because emit was the failing call).
@@ -750,7 +623,6 @@ async def test_env_survives_daemon_restart(env):
 
     # Fresh scheduler over the same store = daemon restart
     cfg = AgentDConfig()
-    cfg.limits.max_total_workers = 2
     sch2 = Scheduler(store, bus, cfg)
     rt = _FakeRuntime()
     sch2.set_runtime(rt)  # ty: ignore[invalid-argument-type]

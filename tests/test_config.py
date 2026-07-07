@@ -2,15 +2,10 @@
 
 from pathlib import Path
 
-import pytest
-
 from agentd.config import AgentDConfig
 
 CONFIG_YAML = """\
-limits:
-  max_depth: 3
-  max_children_per_parent: 4
-  max_total_workers: 64
+default_backend: claude
 """
 
 
@@ -24,9 +19,7 @@ def test_load_explicit_path(tmp_path):
     cfg_file.write_text(CONFIG_YAML, encoding="utf-8")
 
     cfg = AgentDConfig.load(str(cfg_file))
-    assert cfg.limits.max_depth == 3
-    assert cfg.limits.max_children_per_parent == 4
-    assert cfg.limits.max_total_workers == 64
+    assert cfg.default_backend == "claude"
 
 
 def test_load_explicit_path_with_workspace(tmp_path, monkeypatch):
@@ -49,8 +42,6 @@ def test_load_none_returns_default_when_no_file_exists(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENTD_CONFIG", raising=False)
 
     cfg = AgentDConfig.load(None)
-    assert cfg.limits.max_depth == 3
-    assert cfg.limits.max_children_per_parent == 8
     assert cfg.default_backend == "pi"
 
 
@@ -65,7 +56,7 @@ def test_load_none_discovers_xdg_config_home(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENTD_CONFIG", raising=False)
 
     cfg = AgentDConfig.load(None)
-    assert cfg.limits.max_depth == 3
+    assert cfg.default_backend == "claude"
 
 
 def test_load_none_falls_back_to_home_config(tmp_path, monkeypatch):
@@ -78,51 +69,23 @@ def test_load_none_falls_back_to_home_config(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     cfg = AgentDConfig.load(None)
-    assert cfg.limits.max_depth == 3
+    assert cfg.default_backend == "claude"
 
 
 def test_agentd_config_env_has_priority(tmp_path, monkeypatch):
     env_cfg = tmp_path / "env-config.yaml"
-    env_cfg.write_text("limits:\n  max_depth: 7\n", encoding="utf-8")
+    env_cfg.write_text("default_backend: codex\n", encoding="utf-8")
 
     xdg_cfg = tmp_path / "xdg" / "agentd" / "config.yaml"
     xdg_cfg.parent.mkdir(parents=True)
-    xdg_cfg.write_text("limits:\n  max_depth: 2\n", encoding="utf-8")
+    xdg_cfg.write_text("default_backend: claude\n", encoding="utf-8")
 
     monkeypatch.setenv("AGENTD_CONFIG", str(env_cfg))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     cfg = AgentDConfig.load(None)
-    assert cfg.limits.max_depth == 7
-
-
-# ---------------------------------------------------------------------------
-# Env overrides
-# ---------------------------------------------------------------------------
-
-
-def test_env_overrides_limits(tmp_path, monkeypatch):
-    cfg_file = tmp_path / "config.yaml"
-    cfg_file.write_text(CONFIG_YAML, encoding="utf-8")
-
-    monkeypatch.setenv("AGENTD_LIMITS_MAX_DEPTH", "9")
-    monkeypatch.setenv("AGENTD_LIMITS_MAX_CHILDREN_PER_PARENT", "10")
-    monkeypatch.setenv("AGENTD_LIMITS_MAX_TOTAL_WORKERS", "999")
-
-    cfg = AgentDConfig.load(str(cfg_file))
-    assert cfg.limits.max_depth == 9
-    assert cfg.limits.max_children_per_parent == 10
-    assert cfg.limits.max_total_workers == 999
-
-
-def test_invalid_env_override_exits(monkeypatch):
-    monkeypatch.setenv("AGENTD_LIMITS_MAX_DEPTH", "abc")
-    monkeypatch.delenv("AGENTD_CONFIG", raising=False)
-
-    with pytest.raises(SystemExit) as exc_info:
-        AgentDConfig.load(None)
-    assert "AGENTD_LIMITS_MAX_DEPTH" in str(exc_info.value)
+    assert cfg.default_backend == "codex"
 
 
 # ---------------------------------------------------------------------------

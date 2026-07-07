@@ -16,13 +16,6 @@ import yaml
 
 
 @dataclass(slots=True)
-class LimitsConfig:
-    max_depth: int = 3
-    max_children_per_parent: int = 8
-    max_total_workers: int = 64
-
-
-@dataclass(slots=True)
 class InboxGatewayConfig:
     enabled: bool = False
     host: str = "127.0.0.1"
@@ -48,7 +41,6 @@ class ChannelConfig:
 
 @dataclass(slots=True)
 class AgentDConfig:
-    limits: LimitsConfig = field(default_factory=LimitsConfig)
     default_backend: str = "pi"
     channels: dict[str, ChannelConfig] = field(default_factory=dict)
     inbox_gateway: InboxGatewayConfig = field(default_factory=InboxGatewayConfig)
@@ -63,7 +55,6 @@ class AgentDConfig:
 
         if path is None or not path.exists():
             cfg = cls(source=source)
-            _apply_env_overrides(cfg.limits)
             cfg.workspace = _resolve_workspace(None)
             return cfg
 
@@ -71,11 +62,7 @@ class AgentDConfig:
         if not isinstance(raw, dict):
             raw = {}
 
-        limits = _parse_limits(raw.get("limits"))
-        _apply_env_overrides(limits)
-
         return cls(
-            limits=limits,
             default_backend=_str_or(raw.get("default_backend"), "pi"),
             channels=_parse_channels(raw.get("channels")),
             inbox_gateway=_parse_inbox(raw.get("inbox_gateway")),
@@ -141,16 +128,6 @@ def _str_or(val: Any, default: str) -> str:
     return default
 
 
-def _parse_limits(raw: Any) -> LimitsConfig:
-    if not isinstance(raw, dict):
-        return LimitsConfig()
-    return LimitsConfig(
-        max_depth=int(raw.get("max_depth", 3)),
-        max_children_per_parent=int(raw.get("max_children_per_parent", 8)),
-        max_total_workers=int(raw.get("max_total_workers", 64)),
-    )
-
-
 def _resolve_env_ref(value: str) -> str:
     """Resolve ${VAR} references from os.environ."""
     return re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), value)
@@ -214,20 +191,6 @@ def _parse_inbox(raw: Any) -> InboxGatewayConfig:
     if isinstance(url, str) and url.strip():
         cfg.public_base_url = url.strip().rstrip("/")
     return cfg
-
-
-def _apply_env_overrides(limits: LimitsConfig) -> None:
-    for attr, var in [
-        ("max_depth", "AGENTD_LIMITS_MAX_DEPTH"),
-        ("max_children_per_parent", "AGENTD_LIMITS_MAX_CHILDREN_PER_PARENT"),
-        ("max_total_workers", "AGENTD_LIMITS_MAX_TOTAL_WORKERS"),
-    ]:
-        raw = os.environ.get(var)
-        if raw is not None:
-            try:
-                setattr(limits, attr, int(raw.strip()))
-            except ValueError:
-                raise SystemExit(f"error: invalid {var}: {raw!r}") from None
 
 
 def _resolve_workspace(raw: Any) -> str | None:

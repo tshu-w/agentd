@@ -788,7 +788,6 @@ class MethodDispatcher:
                         "active_actors": len([a for a in actors if a["state"] == "active"]),
                         "idle_actors": len([a for a in actors if a["state"] == "idle"]),
                         "running_turns": len(running_turns),
-                        "max_workers": self.config.limits.max_total_workers,
                     },
                 },
             ),

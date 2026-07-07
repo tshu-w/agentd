@@ -206,26 +206,6 @@ class Store:
         )
         return self._actor_dict(row)
 
-    def count_children(self, parent_actor_id: str) -> int:
-        row = (
-            self.db.connect()
-            .execute(
-                "SELECT COUNT(*) AS c FROM actors WHERE parent_actor_id = ? AND state != 'closed'",
-                (parent_actor_id,),
-            )
-            .fetchone()
-        )
-        return int(row["c"]) if row else 0
-
-    def actor_depth(self, actor_id: str) -> int:
-        """Compute depth of actor in the tree (root = 0)."""
-        depth = 0
-        current = self.get_actor(actor_id)
-        while current and current.get("parent_actor_id"):
-            depth += 1
-            current = self.get_actor(current["parent_actor_id"])
-        return depth
-
     def list_actors(
         self,
         *,

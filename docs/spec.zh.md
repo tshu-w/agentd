@@ -146,8 +146,6 @@ Actor 0..1──N Actor (parent/child)
 
 - parent/child 关系持久化在 `parent_actor_id` 字段
 - Spawn 时通过 `parent_actor_id` 参数建立
-- 深度限制：`max_depth`（config，默认 3）
-- 每 parent 子 actor 数限制：`max_children_per_parent`（config，默认 8）
 
 #### Close 子树
 
@@ -486,11 +484,6 @@ CLI flag → 环境变量 → 配置文件 → 内置默认值
 ```yaml
 default_backend: pi
 
-limits:
-  max_depth: 3
-  max_children_per_parent: 8
-  max_total_workers: 64
-
 channels:
   telegram:                                # 内置，无需 command
     spawn:                                 # 可选：该 channel 创建 actor 的默认值
@@ -507,7 +500,6 @@ inbox_gateway:
 ```
 
 - `default_backend`：`--backend` 省略时使用，默认 `pi`
-- `limits`：并发和深度限制
 - `channels`：由 daemon 托管的 channel adapter。内置 channel（`telegram`、`cli`）只需配 `env`；自定义 channel 需指定 `command`（字符串列表）。每个 channel 可包含 `spawn:` 块，设置该 channel 创建 actor 时的 `backend`、`cwd`、`args` 默认值。环境变量值支持 `${VAR}` 引用，在 daemon 启动时从宿主环境解析。`enabled: false` 的 channel 被跳过。内置 channel 依赖通过 extras 安装：`pip install agentd[telegram]`。
 - `inbox_gateway`：HTTP inbox bridge 配置；`public_base_url` 用于反向代理场景
 
@@ -627,9 +619,9 @@ Daemon 启动时对残留状态做确定性收敛：
 3. 对每个 active actor 的 `pending` turn：重新调度执行
 4. 对每个 `idle` actor 且有 queued message：触发 wakeup
 
-### 并发限制
+### 并发
 
-`max_total_workers` 上限。当 running turns 达到上限时，新 turn 保持 `pending` 排队，待有空位时再调度。
+每个 actor 同时只跑一个 turn——并发数等于同时活跃的 actor 数，而 actor 只能由显式 `spawn` 创建。没有全局 worker 上限或调度队列。
 
 ### 已知限制（v1）
 

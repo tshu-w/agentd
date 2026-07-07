@@ -146,8 +146,6 @@ Transitions: `pending -> running`, `pending -> ended`, `running -> ended`
 
 - Parent/child relationship is persisted in the `parent_actor_id` field
 - Established via `parent_actor_id` parameter at spawn time
-- Depth limit: `max_depth` (config, default 3)
-- Per-parent child count limit: `max_children_per_parent` (config, default 8)
 
 #### Close Subtree
 
@@ -486,11 +484,6 @@ Resolution: `AGENTD_WORKSPACE` → config `workspace` → `${XDG_STATE_HOME:-~/.
 ```yaml
 default_backend: pi
 
-limits:
-  max_depth: 3
-  max_children_per_parent: 8
-  max_total_workers: 64
-
 channels:
   telegram:                                # built-in, no command needed
     spawn:                                 # optional defaults for actors from this channel
@@ -507,7 +500,6 @@ inbox_gateway:
 ```
 
 - `default_backend`: used when `--backend` is omitted, default `pi`
-- `limits`: concurrency and depth limits
 - `channels`: channel adapters supervised by the daemon. Built-in channels (`telegram`, `cli`) need only `env`; custom channels specify `command` (list of strings). Each channel may include a `spawn:` block with `backend`, `cwd`, and `args` defaults for actors created by that channel. Environment values support `${VAR}` references resolved from the daemon's environment at startup. Channels with `enabled: false` are skipped. Install built-in channel dependencies via extras: `pip install agentd[telegram]`.
 - `inbox_gateway`: HTTP inbox bridge configuration; `public_base_url` for reverse proxy scenarios
 
@@ -627,9 +619,9 @@ On daemon startup, deterministically converge stale state:
 3. For each active actor's `pending` turn: reschedule execution
 4. For each `idle` actor with queued messages: trigger wakeup
 
-### Concurrency Limit
+### Concurrency
 
-`max_total_workers` upper bound. When running turns reach the limit, new turns stay `pending` in queue until capacity frees up.
+One turn per actor — concurrency equals the number of concurrently active actors, which only grow via explicit `spawn`. There is no global worker limit or dispatch queue.
 
 ### Known Limitations (v1)
 

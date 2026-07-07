@@ -4,12 +4,6 @@
 # Default backend for new actors (pi | claude | codex)
 default_backend: pi
 
-# Concurrency and depth limits
-limits:
-  max_total_workers: 64       # max concurrent running turns across all actors
-  max_depth: 3                # max actor nesting depth
-  max_children_per_parent: 8  # max child actors per parent
-
 # Channel adapters — launched and supervised by the daemon
 # Built-in channels (telegram, cli) need no command.
 # Custom channels specify a command.

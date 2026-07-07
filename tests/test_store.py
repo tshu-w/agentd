@@ -450,35 +450,6 @@ def test_list_subtree(store):
     assert ids[-1] == parent["actor_id"]
 
 
-def test_count_children(store):
-    parent = store.create_actor(name="p", scope_id=ROOT_SCOPE, backend="pi")
-    store.create_actor(
-        name="c1",
-        scope_id=parent["actor_id"],
-        parent_actor_id=parent["actor_id"],
-        backend="pi",
-    )
-    store.create_actor(
-        name="c2",
-        scope_id=parent["actor_id"],
-        parent_actor_id=parent["actor_id"],
-        backend="pi",
-    )
-    assert store.count_children(parent["actor_id"]) == 2
-
-
-def test_actor_depth(store):
-    p = store.create_actor(name="p", scope_id=ROOT_SCOPE, backend="pi")
-    c = store.create_actor(
-        name="c",
-        scope_id=p["actor_id"],
-        parent_actor_id=p["actor_id"],
-        backend="pi",
-    )
-    assert store.actor_depth(p["actor_id"]) == 0
-    assert store.actor_depth(c["actor_id"]) == 1
-
-
 # ---------------------------------------------------------------------------
 # Checkpoint
 # ---------------------------------------------------------------------------

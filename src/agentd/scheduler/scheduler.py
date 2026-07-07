@@ -56,11 +56,6 @@ class Scheduler:
         self.event_bus = event_bus
         self.config = config
         self._runtime: Runtime | None = None
-        # Concurrency tracking (counts actually dispatched turns, not pending)
-        self._running_count = 0
-        # Turns handed to the runtime but still PENDING in the store (the
-        # runtime flips them to RUNNING async); guards against re-dispatch.
-        self._dispatched_turns: set[str] = set()
 
     def set_runtime(self, runtime: Runtime) -> None:
         self._runtime = runtime
@@ -90,14 +85,6 @@ class Scheduler:
             if parent["state"] == ActorState.CLOSED.value:
                 raise SpawnError("actor_closed", f"parent actor is closed: {parent_actor_id}")
             scope_id = parent_actor_id
-            # Depth check
-            depth = self.store.actor_depth(parent_actor_id) + 1
-            if depth > self.config.limits.max_depth:
-                raise SpawnError("forbidden", f"max depth exceeded: {depth}")
-            # Children count check
-            count = self.store.count_children(parent_actor_id)
-            if count >= self.config.limits.max_children_per_parent:
-                raise SpawnError("forbidden", f"max children exceeded: {count}")
         else:
             scope_id = ROOT_SCOPE
 
@@ -233,7 +220,6 @@ class Scheduler:
                     await self._runtime.stop_turn(turn["turn_id"])
                 else:
                     # Pending turn (or no runtime): end directly in store
-                    self._dispatched_turns.discard(turn["turn_id"])
                     self.store.end_turn_atomic(
                         turn["turn_id"],
                         actor_id,
@@ -365,7 +351,6 @@ class Scheduler:
             return
 
         actor_id = turn["actor_id"]
-        self._dispatched_turns.discard(turn_id)
 
         # End turn atomically (acks the claimed message)
         self.store.end_turn_atomic(
@@ -375,7 +360,6 @@ class Scheduler:
             result=result,
             error=error,
         )
-        self._running_count = max(0, self._running_count - 1)
 
         # Emit turn.end event
         seq = self.store.append_event(
@@ -424,9 +408,6 @@ class Scheduler:
         ):
             await self._try_open_turn(actor_id)
 
-        # Global wakeup: try to schedule other actors blocked by concurrency
-        await self._try_schedule_waiting()
-
     def publish_event(
         self,
         actor_id: str,
@@ -470,10 +451,9 @@ class Scheduler:
         real workflow needs that distinction.
 
         Delivery is best-effort: any exception is swallowed so the rest of
-        on_turn_completed (notably _try_schedule_waiting) keeps running. The
-        child's turn.end is already persisted; missing a wakeup is recoverable
-        by the supervisor checking `agentd ps`, missing global scheduling is
-        not.
+        on_turn_completed (notably the child's own wakeup chain) keeps
+        running. The child's turn.end is already persisted; missing a wakeup
+        is recoverable by the supervisor checking `agentd ps`.
 
         ``wake=False`` enqueues without opening a turn on the parent. Reconcile
         needs this: waking mid-reconcile would create a fresh pending turn that
@@ -540,10 +520,8 @@ class Scheduler:
     async def _try_open_turn(self, actor_id: str) -> dict[str, Any] | None:
         """Open a new turn for the actor.
 
-        Always creates the turn + claims message (actor → active).
-        Dispatches to runtime only if capacity is available; otherwise
-        the turn stays ``pending`` and is picked up by
-        ``_try_schedule_waiting`` when a slot opens.
+        Creates the turn + claims message (actor → active) and dispatches to
+        the runtime. Concurrency is bounded naturally: one turn per actor.
         """
         result = self.store.open_turn_atomic(actor_id)
         if result is None:
@@ -581,11 +559,8 @@ class Scheduler:
             seq,
         )
 
-        # Dispatch to runtime if capacity available
-        if self._running_count < self.config.limits.max_total_workers:
-            self._dispatch_to_runtime(turn_id, actor_id, input_messages, env_overlay)
-        else:
-            logger.info("capacity full, turn %s pending for actor %s", turn_id, actor_id)
+        # Dispatch to runtime
+        self._dispatch_to_runtime(turn_id, actor_id, input_messages, env_overlay)
 
         return {
             "actor_state": "active",
@@ -602,7 +577,6 @@ class Scheduler:
         """Send a pending turn to the runtime for execution."""
         if not self._runtime:
             return
-        self._dispatched_turns.add(turn_id)
         actor = self.store.get_actor(actor_id)
         if actor is None:
             # Actors are never physically deleted (only marked CLOSED), so this
@@ -627,7 +601,6 @@ class Scheduler:
                 env=merged_env,
             )
         )
-        self._running_count += 1
 
     async def _close_subtree(self, actor_id: str) -> int:
         """Recursively close actor and all descendants."""
@@ -641,29 +614,21 @@ class Scheduler:
             if a["state"] == ActorState.ACTIVE.value:
                 turn = self.store.get_active_turn(aid)
                 if turn and self._runtime:
-                    was_running = turn["state"] == TurnState.RUNNING.value
                     await self._runtime.cancel_turn(turn["turn_id"])
                     # Force end if runtime didn't complete it
                     turn = self.store.get_turn(turn["turn_id"])
                     if turn and turn["state"] != TurnState.ENDED.value:
-                        self._dispatched_turns.discard(turn["turn_id"])
                         self.store.end_turn_atomic(
                             turn["turn_id"],
                             aid,
                             outcome=TurnOutcome.CANCELED,
                         )
-                        if was_running:
-                            self._running_count = max(0, self._running_count - 1)
                 elif turn:
-                    was_running = turn["state"] == TurnState.RUNNING.value
-                    self._dispatched_turns.discard(turn["turn_id"])
                     self.store.end_turn_atomic(
                         turn["turn_id"],
                         aid,
                         outcome=TurnOutcome.CANCELED,
                     )
-                    if was_running:
-                        self._running_count = max(0, self._running_count - 1)
             # Close actor
             if a["state"] != ActorState.CLOSED.value:
                 self.store.transition_actor(aid, ActorState.CLOSED)
@@ -764,15 +729,11 @@ class Scheduler:
                     wake=False,
                 )
 
-        # 3. Reschedule pending turns (env comes back with the claimed message;
-        #    capacity-blocked turns stay pending and are found again by
-        #    _try_schedule_waiting via list_pending_turns)
+        # 3. Reschedule pending turns (env comes back with the claimed message)
         for turn in self.store.list_pending_turns():
             actor_id = turn["actor_id"]
             actor = self.store.get_actor(actor_id)
             if actor and actor["state"] == ActorState.ACTIVE.value:
-                if self._running_count >= self.config.limits.max_total_workers:
-                    continue
                 claimed = self.store.get_claimed_message(actor_id)
                 input_messages = [claimed] if claimed else []
                 env_overlay = claimed.get("env") if claimed else None
@@ -780,33 +741,6 @@ class Scheduler:
 
         # 4. Wakeup idle actors with queued messages
         for actor in self.store.list_idle_actors_with_queued():
-            await self._try_open_turn(actor["actor_id"])
-
-    # ------------------------------------------------------------------
-    # Pending turn scheduling (for concurrency limit)
-    # ------------------------------------------------------------------
-
-    async def _try_schedule_waiting(self) -> None:
-        """Dispatch pending turns and wake idle actors when capacity available."""
-        if self._running_count >= self.config.limits.max_total_workers:
-            return
-
-        # 1. Dispatch capacity-blocked pending turns
-        for turn in self.store.list_pending_turns():
-            if self._running_count >= self.config.limits.max_total_workers:
-                return
-            if turn["turn_id"] in self._dispatched_turns:
-                continue
-            actor_id = turn["actor_id"]
-            claimed = self.store.get_claimed_message(actor_id)
-            input_messages = [claimed] if claimed else []
-            env_overlay = claimed.get("env") if claimed else None
-            self._dispatch_to_runtime(turn["turn_id"], actor_id, input_messages, env_overlay)
-
-        # 2. Open new turns for idle actors with queued messages
-        for actor in self.store.list_idle_actors_with_queued():
-            if self._running_count >= self.config.limits.max_total_workers:
-                return
             await self._try_open_turn(actor["actor_id"])
 
 
